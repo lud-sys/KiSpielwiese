@@ -25,7 +25,7 @@ def get_robust_session() -> requests.Session:
     return session
 
 # ==========================================
-# 1. MARKTDATEN (100% Finnhub, Bulletproof)
+# 1. MARKTDATEN (Finnhub)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
     if not api_key: return query.strip().upper()
@@ -53,11 +53,11 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
     
     # 1. Unternehmensprofil & Metriken
     try:
-        prof = session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={token}").json()
-        mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}").json()
+        prof = session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={token}", timeout=5).json()
+        mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}", timeout=5).json()
         
         info["shortName"] = prof.get("name", ticker)
-        info["country"] = prof.get("country", "United States")
+        info["country"] = prof.get("country", "US") # Default auf US falls leer
         if prof.get("marketCapitalization"):
             info["marketCap"] = prof.get("marketCapitalization") * 1000000 
             
@@ -67,23 +67,22 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
             if dy: info["dividendYield"] = dy / 100.0
     except: pass
 
-    # 2. Kurse (Versuch 1: Historie für Trendlinien)
+    # 2. Kurse (Historie für Trendlinien)
     now = int(time.time())
     three_months_ago = now - (90 * 24 * 60 * 60)
     try:
-        res = session.get(f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={token}")
+        res = session.get(f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={token}", timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get("s") == "ok":
                 df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
     except: pass
 
-    # 2.5 FALLBACK (Versuch 2: Wenn Historie fehlschlägt, holen wir zumindest den Live-Kurs!)
+    # Fallback für Live-Kurs
     if df.empty:
         try:
-            quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}").json()
+            quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}", timeout=5).json()
             if quote and "c" in quote and quote["c"] > 0:
-                # Wir bauen eine Dummy-Tabelle für Gestern und Heute, damit die App nicht crasht
                 df = pd.DataFrame({
                     "Close": [quote["pc"], quote["c"]],
                     "Open": [quote["o"], quote["o"]]
@@ -94,7 +93,7 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
     try:
         today_str = datetime.now().strftime('%Y-%m-%d')
         week_ago_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-        news_res = session.get(f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={token}").json()
+        news_res = session.get(f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={token}", timeout=5).json()
         if isinstance(news_res, list):
             for n in news_res[:15]: 
                 news_mapped.append({"title": n.get("headline", ""), "publisher": n.get("source", "")})
@@ -108,7 +107,6 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
     reference = hist["Close"].iloc[-2] if len(hist) >= 2 else hist["Open"].iloc[-1]
     change_pct = ((close_price - reference) / reference) * 100 if reference else 0.0
 
-    # Trend nur berechnen, wenn wir echte historische Daten haben
     if len(hist) >= 20:
         sma20 = hist["Close"].rolling(window=20).mean().iloc[-1]
         if close_price > sma20 * 1.02: trend = "🟢 Bullisch"
@@ -197,7 +195,7 @@ def get_macro_data(api_key: str) -> dict:
     endpoints = {"US Leitzins": "FEDFUNDS", "US Inflation": "CPIAUCSL"}
     for name, series_id in endpoints.items():
         try:
-            res = session.get(f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=1", timeout=3)
+            res = session.get(f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=1", timeout=5)
             if res.status_code == 200:
                 data[name] = {"value": round(float(res.json()['observations'][0]['value']), 2)}
         except: pass
@@ -207,34 +205,41 @@ def get_euro_macro_data() -> dict:
     session = get_robust_session()
     data = {}
     try:
-        # Timeout auf 10 Sekunden erhöht, da DBnomics manchmal etwas länger lädt!
         res = session.get("https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV", timeout=10)
-        
         if res.status_code == 200:
             json_data = res.json()
-            # Sicherheitscheck, falls die Datenbank ihre JSON-Struktur minimal ändert
-            if 'series' in json_data and 'docs' in json_data['series'] and len(json_data['series']['docs']) > 0:
-                val = json_data['series']['docs'][0]['value'][-1]
-                if val is not None: 
-                    data["EZB Leitzins"] = {"value": round(val, 2)}
-        else:
-            print(f"DBnomics Error: Status {res.status_code}")
-            
+            if 'series' in json_data and 'docs' in json_data['series']:
+                values = json_data['series']['docs'][0]['value']
+                # FIX: Gehe die Liste rückwärts durch und finde den ersten Wert, der nicht 'NA' ist
+                for v in reversed(values):
+                    if v is not None and str(v).lower() != 'na':
+                        data["EZB Leitzins"] = {"value": round(float(v), 2)}
+                        break
     except Exception as e: 
-        print(f"DBnomics Exception: {e}")
-        
+        print(f"DBnomics Fehler: {e}")
     return data
 
 def get_sec_filings(ticker: str, email: str) -> list[dict]:
     if not email: return []
     session = get_robust_session()
-    session.headers.update({"User-Agent": f"TrueFin App {email}"})
+    
+    # FIX: Strenger SEC User-Agent (Firma/App Name (email))
+    clean_email = email.strip()
+    session.headers.update({
+        "User-Agent": f"TrueFin_Terminal ({clean_email})",
+        "Accept-Encoding": "gzip, deflate"
+    })
+    
     try:
-        cik_res = session.get("https://www.sec.gov/files/company_tickers.json", timeout=3).json()
-        cik = next((str(entry['cik_str']).zfill(10) for entry in cik_res.values() if entry['ticker'].upper() == ticker.upper()), None)
+        # Timeout erhöht auf 10s wegen der großen Datei
+        cik_res = session.get("https://www.sec.gov/files/company_tickers.json", timeout=10)
+        if cik_res.status_code != 200: return []
+        
+        cik_data = cik_res.json()
+        cik = next((str(entry['cik_str']).zfill(10) for entry in cik_data.values() if entry['ticker'].upper() == ticker.upper()), None)
         if not cik: return []
         
-        recent = session.get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=3).json()['filings']['recent']
+        recent = session.get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=10).json()['filings']['recent']
         results = []
         for i in range(len(recent['form'])):
             if recent['form'][i] in ["10-K", "10-Q", "8-K"]:
@@ -248,17 +253,19 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
                 })
             if len(results) >= 3: break
         return results
-    except: return []
+    except Exception as e: 
+        print(f"SEC Fehler: {e}")
+        return []
 
 def get_finnhub_data(ticker: str, api_key: str) -> dict:
     if not api_key: return {}
     session = get_robust_session()
     data = {}
     try:
-        rec_res = session.get(f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={api_key.strip()}", timeout=3)
+        rec_res = session.get(f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={api_key.strip()}", timeout=5)
         if rec_res.status_code == 200 and len(rec_res.json()) > 0: data["recommendations"] = rec_res.json()[0]
             
-        ins_res = session.get(f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from=2024-01-01&to=2024-12-31&token={api_key.strip()}", timeout=3)
+        ins_res = session.get(f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from=2024-01-01&to=2024-12-31&token={api_key.strip()}", timeout=5)
         if ins_res.status_code == 200 and ins_res.json().get('data'):
             avg_mspr = round(sum(d['mspr'] for d in ins_res.json()['data']) / len(ins_res.json()['data']), 2)
             data["insider"] = {"mspr": avg_mspr}

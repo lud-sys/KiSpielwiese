@@ -64,14 +64,15 @@ def inject_custom_css():
     footer {visibility: hidden;}
     .block-container { padding-top: 2rem !important; max-width: 1150px; }
     
-    /* FIX FÜR DIE BOXEN: Feste Höhe erzwingen, damit alle Boxen exakt gleich groß sind */
+    /* MOBILE-FIX: min-height statt starrer Höhe, damit die Boxen auf dem Handy umbrechen dürfen! */
     .feature-card {
         background-color: #1E2530;
         border: 1px solid #2D3748;
         border-radius: 12px;
         padding: 20px;
         transition: all 0.3s ease;
-        height: 250px !important;  /* <-- HIER IST DER FIX */
+        min-height: 250px !important; 
+        height: 100%;
         display: flex;
         flex-direction: column;
     }
@@ -172,7 +173,9 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
 
     st.markdown("<br>", unsafe_allow_html=True)
 
-    is_us_stock = info.get("country") == "United States" if info.get("country") else "." not in ticker
+    # FIX: Finnhub gibt "US" zurück, nicht "United States". So erscheint der SEC Tab endlich!
+    country = info.get("country", "")
+    is_us_stock = country in ["US", "United States"] if country else "." not in ticker
 
     tab_names = ["🧠 KI-Analyse", "📈 Interaktiver Chart", "📰 Signal vs. Rauschen"]
     if is_us_stock:
@@ -283,7 +286,6 @@ def main():
                 st.session_state.search_history.pop(0)
                 
     def handle_search():
-        # .get() verhindert den Absturz, falls der Key kurzzeitig fehlt!
         val = st.session_state.get("search_input", "").strip()
         set_target(val if val else None)
 
@@ -352,7 +354,9 @@ def main():
                 status.update(label="Fehler bei der Datenabfrage", state="error", expanded=True)
                 st.error(f"Keine Daten für '{ticker}' gefunden. Bitte überprüfe die Schreibweise.")
             else:
-                is_us_stock = info.get("country") == "United States" if info.get("country") else "." not in ticker
+                # Hier nochmal prüfen für Status Updates
+                country = info.get("country", "")
+                is_us_stock = country in ["US", "United States"] if country else "." not in ticker
                 sec_filings = []
                 
                 if is_us_stock and sec_email:
