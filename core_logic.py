@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
+# Das offizielle DBnomics Paket importieren!
+from dbnomics import fetch_series
+
 # ==========================================
 # KONFIGURATION
 # ==========================================
@@ -57,7 +60,7 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
         mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}", timeout=5).json()
         
         info["shortName"] = prof.get("name", ticker)
-        info["country"] = prof.get("country", "US") # Default auf US falls leer
+        info["country"] = prof.get("country", "US") 
         if prof.get("marketCapitalization"):
             info["marketCap"] = prof.get("marketCapitalization") * 1000000 
             
@@ -192,29 +195,29 @@ def get_macro_data(api_key: str) -> dict:
     if not api_key: return {}
     session = get_robust_session()
     data = {}
-    endpoints = {"US Leitzins": "FEDFUNDS", "US Inflation": "CPIAUCSL"}
-    for name, series_id in endpoints.items():
+    # FIX: Inflation braucht units=pc1 (Percent Change from Year Ago) statt dem rohen Index!
+    endpoints = {
+        "US Leitzins": {"id": "FEDFUNDS", "units": "lin"},
+        "US Inflation": {"id": "CPIAUCSL", "units": "pc1"}
+    }
+    for name, cfg in endpoints.items():
         try:
-            res = session.get(f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=1", timeout=5)
+            res = session.get(f"https://api.stlouisfed.org/fred/series/observations?series_id={cfg['id']}&units={cfg['units']}&api_key={api_key}&file_type=json&sort_order=desc&limit=1", timeout=5)
             if res.status_code == 200:
-                data[name] = {"value": round(float(res.json()['observations'][0]['value']), 2)}
+                val = float(res.json()['observations'][0]['value'])
+                data[name] = {"value": round(val, 2)}
         except: pass
     return data
 
 def get_euro_macro_data() -> dict:
-    session = get_robust_session()
     data = {}
     try:
-        res = session.get("https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV", timeout=10)
-        if res.status_code == 200:
-            json_data = res.json()
-            if 'series' in json_data and 'docs' in json_data['series']:
-                values = json_data['series']['docs'][0]['value']
-                # FIX: Gehe die Liste rückwärts durch und finde den ersten Wert, der nicht 'NA' ist
-                for v in reversed(values):
-                    if v is not None and str(v).lower() != 'na':
-                        data["EZB Leitzins"] = {"value": round(float(v), 2)}
-                        break
+        # FIX: Das offizielle DBnomics Paket nutzen! Das löst alle JSON-Parsierungs-Probleme.
+        df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
+        if not df.empty and 'value' in df.columns:
+            # Drop NA filtert leere Felder automatisch raus
+            last_val = df['value'].dropna().iloc[-1]
+            data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
     except Exception as e: 
         print(f"DBnomics Fehler: {e}")
     return data
@@ -223,7 +226,6 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
     if not email: return []
     session = get_robust_session()
     
-    # FIX: Strenger SEC User-Agent (Firma/App Name (email))
     clean_email = email.strip()
     session.headers.update({
         "User-Agent": f"TrueFin_Terminal ({clean_email})",
@@ -231,7 +233,6 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
     })
     
     try:
-        # Timeout erhöht auf 10s wegen der großen Datei
         cik_res = session.get("https://www.sec.gov/files/company_tickers.json", timeout=10)
         if cik_res.status_code != 200: return []
         
