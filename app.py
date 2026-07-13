@@ -25,18 +25,18 @@ def load_api_keys() -> tuple[str, str, str, str]:
     sec_email = os.environ.get("SEC_API_EMAIL") or st.secrets.get("SEC_API_EMAIL")
     finnhub_key = os.environ.get("FINNHUB_API_KEY") or st.secrets.get("FINNHUB_API_KEY")
     
-    if not gemini_key:
-        st.error("🚨 Kein Gemini-API-Key gefunden.")
+    if not gemini_key or not finnhub_key:
+        st.error("🚨 Gemini-API-Key ODER Finnhub-API-Key fehlt! Bitte in den Secrets hinterlegen.")
         st.stop()
     return gemini_key, fred_key, sec_email, finnhub_key
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def cached_get_ticker(query: str):
-    return get_ticker_from_name(query)
+def cached_get_ticker(query: str, api_key: str):
+    return get_ticker_from_name(query, api_key)
 
 @st.cache_data(ttl=900, show_spinner=False)
-def cached_load_data(ticker: str):
-    return load_stock_data(ticker)
+def cached_load_data(ticker: str, api_key: str):
+    return load_stock_data(ticker, api_key)
 
 @st.cache_data(ttl=43200, show_spinner=False)
 def cached_macro_data(api_key: str):
@@ -64,15 +64,14 @@ def inject_custom_css():
     footer {visibility: hidden;}
     .block-container { padding-top: 2rem !important; max-width: 1150px; }
     
-    /* FIX FÜR DIE BOXEN: min-height sorgt dafür, dass alle gleich groß sind */
+    /* FIX FÜR DIE BOXEN: Feste Höhe erzwingen, damit alle Boxen exakt gleich groß sind */
     .feature-card {
         background-color: #1E2530;
         border: 1px solid #2D3748;
         border-radius: 12px;
         padding: 20px;
         transition: all 0.3s ease;
-        height: 100%;
-        min-height: 230px; 
+        height: 250px !important;  /* <-- HIER IST DER FIX */
         display: flex;
         flex-direction: column;
     }
@@ -160,16 +159,16 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
     st.subheader(f"{company_name} ({ticker})")
     
     kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
-    kpi_col1.metric("Aktueller Kurs", f"${metrics['close']:.2f}", f"{metrics['change_pct']:.2f}%")
-    kpi_col2.metric("Marktkapitalisierung", metrics["market_cap"])
-    kpi_col3.metric("KGV (P/E)", metrics["pe_ratio"])
+    kpi_col1.metric("Aktueller Kurs", f"${metrics.get('close', 0):.2f}", f"{metrics.get('change_pct', 0):.2f}%")
+    kpi_col2.metric("Marktkapitalisierung", metrics.get("market_cap", "N/A"))
+    kpi_col3.metric("KGV (P/E)", metrics.get("pe_ratio", "N/A"))
 
     st.markdown("<br>", unsafe_allow_html=True)
 
     kpi_col4, kpi_col5, kpi_col6 = st.columns(3)
-    kpi_col4.metric("Dividendenrendite", metrics["dividend_yield"])
-    kpi_col5.metric("Trend (SMA 20)", metrics["trend_signal"])
-    kpi_col6.metric("Volatilität (20 Tage)", metrics["volatility"])
+    kpi_col4.metric("Dividendenrendite", metrics.get("dividend_yield", "N/A"))
+    kpi_col5.metric("Trend (SMA 20)", metrics.get("trend_signal", "N/A"))
+    kpi_col6.metric("Volatilität (20 Tage)", metrics.get("volatility", "N/A"))
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -255,7 +254,7 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
                         st.caption(f"Gegenstand: {f['description']}")
                     with col_link:
                         st.link_button("Zum Bericht", f['url'], use_container_width=True)
-            else:
+           else:
                 st.warning("ℹ️ Keine wichtigen SEC-Daten gefunden oder Asset ist nicht an der US-Börse registriert.")
 
 # ==========================================
@@ -333,6 +332,9 @@ def main():
     with search_col2:
         st.button("Analysieren", use_container_width=True, type="primary", on_click=handle_search)
 
+    # ==========================================
+    # ANSICHT: ANALYSE STARTEN
+    # ==========================================
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         loading_container = st.empty()
@@ -340,14 +342,14 @@ def main():
         
         with loading_container.status(f"Analysiere Marktdaten für '{ticker_query}'...", expanded=True) as status:
             st.write("🔍 Identifiziere Ticker-Symbol...")
-            ticker = cached_get_ticker(ticker_query) 
+            ticker = cached_get_ticker(ticker_query, finnhub_key) 
             
             st.write(f"📡 Lade Realtime-Daten für {ticker}...")
-            hist, raw_news, info = cached_load_data(ticker) 
+            hist, raw_news, info = cached_load_data(ticker, finnhub_key) 
             
             if hist.empty:
                 status.update(label="Fehler bei der Datenabfrage", state="error", expanded=True)
-                st.error(f"Keine Daten für '{ticker}' gefunden.")
+                st.error(f"Keine Daten für '{ticker}' gefunden. Bitte überprüfe die Schreibweise.")
             else:
                 is_us_stock = info.get("country") == "United States" if info.get("country") else "." not in ticker
                 sec_filings = []
@@ -372,6 +374,10 @@ def main():
             if ticker != ticker_query: set_target(ticker)
             loading_container.empty()
             render_dashboard(ticker, info, metrics, filtered_news, analysis, len(raw_news), macro_data, euro_macro_data, sec_filings, finnhub_data)
+            
+    # ==========================================
+    # ANSICHT: STARTSEITE
+    # ==========================================
     else:
         st.write("")
         c1, c2, c3 = st.columns(3)
