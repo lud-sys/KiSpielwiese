@@ -283,7 +283,8 @@ def main():
                 st.session_state.search_history.pop(0)
                 
     def handle_search():
-        val = st.session_state.search_input.strip()
+        # .get() verhindert den Absturz, falls der Key kurzzeitig fehlt!
+        val = st.session_state.get("search_input", "").strip()
         set_target(val if val else None)
 
     with st.sidebar:
