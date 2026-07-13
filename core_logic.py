@@ -12,7 +12,7 @@ from google.genai import types
 # ==========================================
 # KONFIGURATION
 # ==========================================
-MODEL_NAME = "gemini-1.5-flash"
+MODEL_NAME = "gemini-3.1-flash-lite"
 
 class FilteredHeadlines(BaseModel):
     relevant_headlines: list[str] = Field(description="Liste von harten, echten Schlagzeilen.")
