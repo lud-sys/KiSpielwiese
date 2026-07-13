@@ -19,88 +19,87 @@ class FilteredHeadlines(BaseModel):
 
 def get_robust_session() -> requests.Session:
     session = requests.Session()
-    session.headers.update({"User-Agent": "TrueFin Terminal"})
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
     return session
 
 # ==========================================
-# 1. MARKTDATEN (Finnhub API - Gefixt!)
+# 1. MARKTDATEN (100% Finnhub, Bulletproof)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
     if not api_key: return query.strip().upper()
     session = get_robust_session()
     try:
-        res = session.get(f"https://finnhub.io/api/v1/search?q={query}&token={api_key}", timeout=5)
+        res = session.get(f"https://finnhub.io/api/v1/search?q={query}&token={api_key.strip()}", timeout=5)
         if res.status_code == 200:
             data = res.json()
             if data.get("result") and len(data["result"]) > 0:
-                # FIX: Wir suchen explizit nach dem US-Ticker (ohne Punkt im Namen), 
-                # da Finnhub im Free-Tier nur US-Historienkurse erlaubt!
                 for item in data["result"]:
                     if "." not in item["symbol"] and item["type"] == "Common Stock":
                         return item["symbol"]
-                # Fallback: Nimm das erste
                 return data["result"][0]["symbol"]
-    except Exception as e:
-        print(f"Fehler bei der Ticker-Suche: {e}")
+    except: pass
     return query.strip().upper()
 
 def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict], dict]:
-    if not api_key: return pd.DataFrame(), [], {}
+    df = pd.DataFrame()
+    info = {}
+    news_mapped = []
+    if not api_key: return df, news_mapped, info
     
     session = get_robust_session()
-    base_url = "https://finnhub.io/api/v1"
+    token = api_key.strip()
     
+    # 1. Unternehmensprofil & Metriken
+    try:
+        prof = session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={token}").json()
+        mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}").json()
+        
+        info["shortName"] = prof.get("name", ticker)
+        info["country"] = prof.get("country", "United States")
+        if prof.get("marketCapitalization"):
+            info["marketCap"] = prof.get("marketCapitalization") * 1000000 
+            
+        if mets.get("metric"):
+            info["trailingPE"] = mets["metric"].get("peExclExtraTTM")
+            dy = mets["metric"].get("dividendYieldIndicatedAnnual")
+            if dy: info["dividendYield"] = dy / 100.0
+    except: pass
+
+    # 2. Kurse (Versuch 1: Historie für Trendlinien)
     now = int(time.time())
     three_months_ago = now - (90 * 24 * 60 * 60)
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    week_ago_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
-
-    # 1. Historische Kurse (Candles)
-    df = pd.DataFrame()
     try:
-        res = session.get(f"{base_url}/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={api_key}")
+        res = session.get(f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={token}")
         if res.status_code == 200:
             data = res.json()
             if data.get("s") == "ok":
                 df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
-            else:
-                print(f"Finnhub Candle Status für {ticker}: {data.get('s')} (Oft ein Zeichen für non-US Ticker im Free-Tier)")
-        else:
-            print(f"Finnhub Candle Fehler Code: {res.status_code}")
-    except Exception as e: 
-        print(f"Exception bei Candles: {e}")
+    except: pass
 
-    # 2. Metadaten (Profil & Metriken)
-    info = {}
-    try:
-        prof = session.get(f"{base_url}/stock/profile2?symbol={ticker}&token={api_key}").json()
-        mets = session.get(f"{base_url}/stock/metric?symbol={ticker}&metric=all&token={api_key}").json()
-
-        info["shortName"] = prof.get("name", ticker)
-        info["country"] = prof.get("country", "")
-        if prof.get("marketCapitalization"):
-            info["marketCap"] = prof.get("marketCapitalization") * 1000000 
-
-        if mets.get("metric"):
-            info["trailingPE"] = mets["metric"].get("peExclExtraTTM")
-            dy = mets["metric"].get("dividendYieldIndicatedAnnual")
-            if dy is not None: info["dividendYield"] = dy / 100.0
-    except Exception as e: 
-        print(f"Exception bei Profil/Metriken: {e}")
+    # 2.5 FALLBACK (Versuch 2: Wenn Historie fehlschlägt, holen wir zumindest den Live-Kurs!)
+    if df.empty:
+        try:
+            quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}").json()
+            if quote and "c" in quote and quote["c"] > 0:
+                # Wir bauen eine Dummy-Tabelle für Gestern und Heute, damit die App nicht crasht
+                df = pd.DataFrame({
+                    "Close": [quote["pc"], quote["c"]],
+                    "Open": [quote["o"], quote["o"]]
+                }, index=[pd.Timestamp.now() - pd.Timedelta(days=1), pd.Timestamp.now()])
+        except: pass
 
     # 3. News
-    news_mapped = []
     try:
-        news_res = session.get(f"{base_url}/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={api_key}").json()
-        if isinstance(news_res, list): # Sicherstellen, dass es eine Liste ist und kein Error-Dict
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        week_ago_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        news_res = session.get(f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={token}").json()
+        if isinstance(news_res, list):
             for n in news_res[:15]: 
                 news_mapped.append({"title": n.get("headline", ""), "publisher": n.get("source", "")})
-    except Exception as e: 
-        print(f"Exception bei News: {e}")
-
+    except: pass
+    
     return df, news_mapped, info
 
 def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
@@ -109,6 +108,7 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
     reference = hist["Close"].iloc[-2] if len(hist) >= 2 else hist["Open"].iloc[-1]
     change_pct = ((close_price - reference) / reference) * 100 if reference else 0.0
 
+    # Trend nur berechnen, wenn wir echte historische Daten haben
     if len(hist) >= 20:
         sma20 = hist["Close"].rolling(window=20).mean().iloc[-1]
         if close_price > sma20 * 1.02: trend = "🟢 Bullisch"
@@ -135,13 +135,9 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
     pe_str = f"{pe:.2f}" if pe and not pd.isna(pe) else "N/A"
 
     return {
-        "close": close_price,
-        "change_pct": change_pct,
-        "market_cap": mc_str,
-        "pe_ratio": pe_str,
-        "dividend_yield": div_str,
-        "trend_signal": trend,
-        "volatility": vol_str
+        "close": close_price, "change_pct": change_pct, "market_cap": mc_str,
+        "pe_ratio": pe_str, "dividend_yield": div_str,
+        "trend_signal": trend, "volatility": vol_str
     }
 
 # ==========================================
@@ -248,10 +244,10 @@ def get_finnhub_data(ticker: str, api_key: str) -> dict:
     session = get_robust_session()
     data = {}
     try:
-        rec_res = session.get(f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={api_key}", timeout=3)
+        rec_res = session.get(f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={api_key.strip()}", timeout=3)
         if rec_res.status_code == 200 and len(rec_res.json()) > 0: data["recommendations"] = rec_res.json()[0]
             
-        ins_res = session.get(f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from=2024-01-01&to=2024-12-31&token={api_key}", timeout=3)
+        ins_res = session.get(f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from=2024-01-01&to=2024-12-31&token={api_key.strip()}", timeout=3)
         if ins_res.status_code == 200 and ins_res.json().get('data'):
             avg_mspr = round(sum(d['mspr'] for d in ins_res.json()['data']) / len(ins_res.json()['data']), 2)
             data["insider"] = {"mspr": avg_mspr}
