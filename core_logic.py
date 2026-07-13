@@ -207,11 +207,22 @@ def get_euro_macro_data() -> dict:
     session = get_robust_session()
     data = {}
     try:
-        res = session.get("https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV", timeout=3)
+        # Timeout auf 10 Sekunden erhöht, da DBnomics manchmal etwas länger lädt!
+        res = session.get("https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV", timeout=10)
+        
         if res.status_code == 200:
-            val = res.json()['series']['docs'][0]['value'][-1]
-            if val is not None: data["EZB Leitzins"] = {"value": round(val, 2)}
-    except: pass
+            json_data = res.json()
+            # Sicherheitscheck, falls die Datenbank ihre JSON-Struktur minimal ändert
+            if 'series' in json_data and 'docs' in json_data['series'] and len(json_data['series']['docs']) > 0:
+                val = json_data['series']['docs'][0]['value'][-1]
+                if val is not None: 
+                    data["EZB Leitzins"] = {"value": round(val, 2)}
+        else:
+            print(f"DBnomics Error: Status {res.status_code}")
+            
+    except Exception as e: 
+        print(f"DBnomics Exception: {e}")
+        
     return data
 
 def get_sec_filings(ticker: str, email: str) -> list[dict]:
