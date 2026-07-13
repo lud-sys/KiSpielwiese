@@ -14,7 +14,7 @@ from core_logic import (
     get_finnhub_data
 )
 
-st.set_page_config(page_title="FinAI Terminal", layout="wide", page_icon="📈")
+st.set_page_config(page_title="TrueFin Terminal", layout="wide", page_icon="📈")
 
 # ==========================================
 # CACHING & SETUP
@@ -64,6 +64,7 @@ def inject_custom_css():
     footer {visibility: hidden;}
     .block-container { padding-top: 2rem !important; max-width: 1150px; }
     
+    /* FIX FÜR DIE BOXEN: min-height sorgt dafür, dass alle gleich groß sind */
     .feature-card {
         background-color: #1E2530;
         border: 1px solid #2D3748;
@@ -71,6 +72,9 @@ def inject_custom_css():
         padding: 20px;
         transition: all 0.3s ease;
         height: 100%;
+        min-height: 230px; 
+        display: flex;
+        flex-direction: column;
     }
     .feature-card:hover {
         border-color: #00FFA3;
@@ -185,7 +189,6 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
             with st.container(border=True):
                 st.markdown(f"**🛡️ KI-Filter aktiv**\n\nVon **{raw_news_count}** Artikeln wurden nur **{len(news_list)}** zugelassen.")
             
-            # --- NEU: FINNHUB UI ---
             if finnhub_data and (finnhub_data.get("recommendations") or finnhub_data.get("insider")):
                 with st.container(border=True):
                     st.markdown("**Wall Street & Insider**")
@@ -245,14 +248,12 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
             st.success(f"📂 Offizielle, marktrelevante SEC-Daten für {ticker} geladen:")
             for f in sec_filings:
                 with st.container(border=True):
-                    # Link wird hier als Button mit Icon angezeigt
                     col_info, col_link = st.columns([3, 1])
                     with col_info:
                         st.markdown(f"### Formular: **{f['form']}**")
                         st.markdown(f"📅 **Filing Date:** {f['filingDate']} | 📊 **Period of Report:** {f['reportDate']}")
                         st.caption(f"Gegenstand: {f['description']}")
                     with col_link:
-                        # Link-Button direkt zur SEC
                         st.link_button("Zum Bericht", f['url'], use_container_width=True)
             else:
                 st.warning("ℹ️ Keine wichtigen SEC-Daten gefunden oder Asset ist nicht an der US-Börse registriert.")
@@ -319,7 +320,7 @@ def main():
                    font-weight: 800; 
                    letter-spacing: -1px;
                    margin-bottom: 0px;'>
-            FinAI Terminal
+            TrueFin Terminal
         </h1>
         <p style='color: #A0AEC0; font-size: 1.15rem; margin-top: 5px; margin-bottom: 25px;'>
             Institutionelle Aktienanalyse. Befreit von Marktrauschen und Clickbait.

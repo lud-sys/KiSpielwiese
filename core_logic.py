@@ -1,307 +1,270 @@
-import datetime
-import requests
 import pandas as pd
 import numpy as np
+import requests
 import yfinance as yf
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-from pydantic import BaseModel, Field
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from dbnomics import fetch_series
 
-# --- KONFIGURATION ---
-MODEL_NAME = "gemini-3.1-flash-lite"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-
-# --- KI-SCHEMA ---
-class HeadlineWithSentiment(BaseModel):
-    headline: str = Field(description="Die bereinigte, relevante Schlagzeile.")
-    sentiment: str = Field(description="Bewertung der Auswirkung: 'BULLISH', 'BEARISH' oder 'NEUTRAL'")
+# ==========================================
+# KONFIGURATION
+# ==========================================
+MODEL_NAME = "gemini-1.5-flash" # Robustes, schnelles Modell für Textaufgaben
 
 class FilteredHeadlines(BaseModel):
-    relevant_headlines: list[HeadlineWithSentiment] = Field(description="Liste der relevanten Schlagzeilen inklusive Sentiment.")
+    relevant_headlines: list[str] = Field(
+        description="Liste von harten, echten Schlagzeilen. Keine Meinung, kein Clickbait."
+    )
 
-# --- UTILS ---
-def get_requests_session() -> requests.Session:
+# ==========================================
+# HELPER: ROBUSTE SESSION (YFINANCE FIX)
+# ==========================================
+def get_robust_session() -> requests.Session:
+    """
+    Täuscht einen echten Chrome-Browser vor und nutzt automatische Wiederholungsversuche.
+    Das verhindert den 'YFRateLimitError' auf Streamlit Cloud!
+    """
     session = requests.Session()
-    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    })
+    
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
-def format_large_number(num: float | int | None) -> str:
-    if num is None or pd.isna(num): return "N/A"
-    if num >= 1_000_000_000_000: return f"{num / 1_000_000_000_000:.2f} Bio. $"
-    if num >= 1_000_000_000: return f"{num / 1_000_000_000:.2f} Mrd. $"
-    if num >= 1_000_000: return f"{num / 1_000_000:.2f} Mio. $"
-    return f"{num:,.2f} $"
-
-# --- DATENBESCHAFFUNG ---
+# ==========================================
+# 1. MARKTDATEN (Yahoo Finance)
+# ==========================================
 def get_ticker_from_name(query: str) -> str:
     url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=1&newsCount=0"
-    session = get_requests_session()
+    session = get_robust_session()
     try:
-        response = session.get(url, headers={'User-Agent': USER_AGENT}, timeout=5)
+        response = session.get(url, timeout=5)
         response.raise_for_status()
         data = response.json()
         if data.get('quotes'):
             return data['quotes'][0]['symbol']
     except requests.RequestException:
-        pass
+        pass 
     return query.strip().upper()
 
 def load_stock_data(ticker: str) -> tuple[pd.DataFrame, list[dict], dict]:
-    stock = yf.Ticker(ticker)
+    """Lädt die Aktienkurse mit der geschützten Session."""
+    session = get_robust_session()
+    stock = yf.Ticker(ticker, session=session)
+    
+    # 3 Monate für die Volatilitäts- und SMA-Berechnung
     hist = stock.history(period="3mo")
     return hist, stock.news, stock.info
 
-def get_macro_data(api_key: str) -> dict:
-    if not api_key: return {}
-    session = get_requests_session()
-    indicators = {
-        "US-Leitzins (FED)": "FEDFUNDS",
-        "10J US-Staatsanleihen": "DGS10",
-        "US-Arbeitslosenquote": "UNRATE"
+def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
+    """Berechnet Finanzkennzahlen, Trend und Volatilität."""
+    if hist.empty: 
+        return {}
+        
+    close_price = hist["Close"].iloc[-1]
+    reference = hist["Close"].iloc[-2] if len(hist) >= 2 else hist["Open"].iloc[-1]
+    change_pct = ((close_price - reference) / reference) * 100 if reference else 0.0
+
+    # Trend (SMA 20)
+    if len(hist) >= 20:
+        sma20 = hist["Close"].rolling(window=20).mean().iloc[-1]
+        if close_price > sma20 * 1.02: trend = "🟢 Bullisch"
+        elif close_price < sma20 * 0.98: trend = "🔴 Bärisch"
+        else: trend = "⚪ Neutral"
+    else:
+        trend = "N/A"
+
+    # Volatilität (Standardabweichung der letzten 20 Tage annualisiert)
+    if len(hist) >= 20:
+        daily_returns = hist["Close"].pct_change().dropna()
+        vol = daily_returns.tail(20).std() * np.sqrt(252) * 100
+        vol_str = f"{vol:.2f}%"
+    else:
+        vol_str = "N/A"
+
+    # Formatierungen
+    mc = info.get("marketCap")
+    if mc is None: mc_str = "N/A"
+    elif mc >= 1e12: mc_str = f"${mc/1e12:.2f} Bio."
+    elif mc >= 1e9: mc_str = f"${mc/1e9:.2f} Mrd."
+    else: mc_str = f"${mc/1e6:.2f} Mio."
+
+    div = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+    div_str = f"{div*100:.2f}%" if div else "N/A"
+
+    pe = info.get("trailingPE")
+    pe_str = f"{pe:.2f}" if pe else "N/A"
+
+    return {
+        "close": close_price,
+        "change_pct": change_pct,
+        "market_cap": mc_str,
+        "pe_ratio": pe_str,
+        "dividend_yield": div_str,
+        "trend_signal": trend,
+        "volatility": vol_str
     }
-    macro_context = {}
-    for name, series_id in indicators.items():
+
+# ==========================================
+# 2. KI ANALYSE (Gemini)
+# ==========================================
+def filter_news_with_ai(client: genai.Client, ticker: str, user_input: str, raw_news: list[dict]) -> list[str]:
+    BLOCKED_PUBLISHERS = ["motley fool", "zacks", "seeking alpha", "investorplace", "tipranks", "thestreet"]
+    
+    pre_filtered = []
+    for n in raw_news:
+        pub = n.get("publisher", n.get("provider", "Unbekannt")).lower()
+        title = n.get("content", {}).get("title", n.get("title", "Kein Titel"))
+        if any(b in pub for b in BLOCKED_PUBLISHERS): continue
+        pre_filtered.append(f"[{pub.title()}] {title}")
+        if len(pre_filtered) >= 15: break
+
+    if not pre_filtered: return []
+
+    prompt = f"""Hier sind aktuelle Schlagzeilen für '{ticker}':\n{chr(10).join(f"- {t}" for t in pre_filtered)}
+    REGELN:
+    1. Behalte AUSSCHLIESSLICH harte Fakten (Quartalszahlen, M&A, Management-Wechsel, Klagen).
+    2. Lösche Clickbait, Ratgeber oder "Aktie X vs Y".
+    3. Gib [] zurück, falls nichts Relevantes dabei ist."""
+
+    try:
+        response = client.models.generate_content(
+            model=MODEL_NAME, 
+            contents=prompt,
+            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=FilteredHeadlines, temperature=0.0)
+        )
+        return response.parsed.relevant_headlines[:5]
+    except: 
+        return []
+
+def generate_analysis(client: genai.Client, ticker: str, metrics: dict, news_list: list[str], macro: dict, euro_macro: dict, sec: list, finnhub: dict) -> str:
+    direction = "gestiegen" if metrics["change_pct"] >= 0 else "gefallen"
+    news_text = "\n".join([f"- {t}" for t in news_list]) if news_list else "KEINE RELEVANTEN NEWS."
+    
+    prompt = f"""Du bist ein institutioneller Analyst. Die Aktie {ticker} ist heute um {abs(metrics['change_pct']):.2f}% {direction} (Kurs: ${metrics['close']:.2f}).
+    
+    Harte Fakten:\n{news_text}
+    
+    Erkläre kurz und professionell, warum sich die Aktie heute so bewegt. Nutze gegebenenfalls makroökonomische Faktoren, falls keine spezifischen News vorliegen.
+    
+    Struktur (Markdown H3):
+    ### 🗞️ Was bewegt den Kurs?
+    ### 📊 Fundamentale Einordnung
+    ### 🤖 Sektor & Makro-Kontext
+    """
+    
+    try:
+        response = client.models.generate_content(model=MODEL_NAME, contents=prompt, config=types.GenerateContentConfig(temperature=0.2))
+        return response.text
+    except Exception as e: 
+        return f"⚠️ Analyse-Fehler: {e}"
+
+# ==========================================
+# 3. EXTERNE APIs (Robust & Fail-Safe)
+# ==========================================
+def get_macro_data(api_key: str) -> dict:
+    """Holt US-Makrodaten von FRED."""
+    if not api_key: return {}
+    session = get_robust_session()
+    data = {}
+    endpoints = {
+        "US Leitzins": "FEDFUNDS",
+        "US Inflation": "CPIAUCSL"
+    }
+    for name, series_id in endpoints.items():
         url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}&api_key={api_key}&file_type=json&sort_order=desc&limit=1"
         try:
-            resp = session.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "observations" in data and len(data["observations"]) > 0:
-                    obs = data["observations"][0]
-                    macro_context[name] = {"date": obs["date"], "value": obs["value"]}
-        except Exception as e:
-            print(f"Fehler FRED: {e}")
-    return macro_context
+            res = session.get(url, timeout=3)
+            if res.status_code == 200:
+                val = float(res.json()['observations'][0]['value'])
+                data[name] = {"value": round(val, 2)}
+        except: pass
+    return data
 
 def get_euro_macro_data() -> dict:
-    euro_context = {}
-    indicators = {
-        "EZB Leitzins": "ECB/FM/D.U2.EUR.4F.KR.MRR_RT.LEV",
-        "EU Arbeitslosenquote": "Eurostat/une_rt_m/M.SA.TOTAL.PC_ACT.EA20",
-        "EU Inflation (HICP)": "Eurostat/prc_hicp_manr/M.RCH_A.CP00.EA20"
-    }
+    """Holt EU-Makrodaten von DBnomics (Kein API Key nötig)."""
+    session = get_robust_session()
+    data = {}
     try:
-        for name, series_id in indicators.items():
-            df = fetch_series(series_id)
-            if df is not None and not df.empty:
-                df_valid = df.dropna(subset=['value'])
-                if not df_valid.empty:
-                    latest = df_valid.iloc[-1]
-                    date_str = latest['period'].strftime('%Y-%m') if hasattr(latest['period'], 'strftime') else str(latest['period'])
-                    euro_context[name] = {"date": date_str, "value": round(latest['value'], 2)}
-    except Exception as e:
-        print(f"Fehler DBnomics: {e}")
-    return euro_context
+        # EZB Leitzins (Main refinancing operations)
+        url = "https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV"
+        res = session.get(url, timeout=3)
+        if res.status_code == 200:
+            val = res.json()['series']['docs'][0]['value'][-1]
+            if val is not None: data["EZB Leitzins"] = {"value": round(val, 2)}
+    except: pass
+    return data
 
 def get_sec_filings(ticker: str, email: str) -> list[dict]:
+    """Holt die neuesten 10-K / 10-Q Berichte von der SEC."""
     if not email: return []
-    clean_ticker = ticker.split(".")[0].upper()
-    session = get_requests_session()
-    headers = {"User-Agent": f"FinAITerminal/1.0 ({email})"}
+    session = get_robust_session()
+    session.headers.update({"User-Agent": f"TrueFin App {email}"})
+    
     try:
-        ticker_map_url = "https://www.sec.gov/files/company_tickers.json"
-        resp = session.get(ticker_map_url, headers=headers, timeout=5)
-        if resp.status_code != 200: return []
+        # 1. CIK Nummer herausfinden
+        cik_res = session.get("https://www.sec.gov/files/company_tickers.json", timeout=3)
+        cik_res.raise_for_status()
+        cik_dict = cik_res.json()
         
-        ticker_data = resp.json()
         cik = None
-        for item in ticker_data.values():
-            if item["ticker"] == clean_ticker:
-                cik = str(item["cik_str"]).zfill(10)
+        for entry in cik_dict.values():
+            if entry['ticker'].upper() == ticker.upper():
+                cik = str(entry['cik_str']).zfill(10)
                 break
                 
         if not cik: return []
         
-        sec_url = f"https://data.sec.gov/submissions/CIK{cik}.json"
-        sec_resp = session.get(sec_url, headers=headers, timeout=5)
-        if sec_resp.status_code != 200: return []
+        # 2. Filings abrufen
+        filings_res = session.get(f"https://data.sec.gov/submissions/CIK{cik}.json", timeout=3)
+        filings_res.raise_for_status()
+        recent = filings_res.json()['filings']['recent']
         
-        filings_data = sec_resp.json().get("filings", {}).get("recent", {})
-        if not filings_data: return []
-        
-        extracted_filings = []
-        WICHTIGE_FORMS = ["10-K", "10-Q", "8-K"]
-        for i in range(len(filings_data.get("form", []))):
-            form_type = filings_data["form"][i]
-            
-            # URL Konstruktion
-            # CIK ohne führende Nullen für den URL-Pfad
-            url_cik = str(int(cik)) 
-            # Accession Number ohne Bindestriche
-            acc_no = filings_data["accessionNumber"][i]
-            acc_no_clean = acc_no.replace("-", "")
-            prim_doc = filings_data["primaryDocument"][i]
-            doc_url = f"https://www.sec.gov/Archives/edgar/data/{url_cik}/{acc_no_clean}/{prim_doc}"
-
-            if form_type in WICHTIGE_FORMS or len(extracted_filings) < 2:
-                extracted_filings.append({
-                    "form": form_type,
-                    "filingDate": filings_data["filingDate"][i],
-                    "reportDate": filings_data["reportDate"][i],
-                    "description": filings_data["primaryDocDescription"][i] or filings_data["primaryDocument"][i],
-                    "url": doc_url # HIER IST DAS NEUE FELD
+        results = []
+        for i in range(len(recent['form'])):
+            if recent['form'][i] in ["10-K", "10-Q", "8-K"]:
+                acc_num = recent['accessionNumber'][i].replace("-", "")
+                results.append({
+                    "form": recent['form'][i],
+                    "filingDate": recent['filingDate'][i],
+                    "reportDate": recent['reportDate'][i] if recent['reportDate'][i] else "N/A",
+                    "description": recent['primaryDocDescription'][i],
+                    "url": f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{acc_num}/{recent['primaryDocument'][i]}"
                 })
-            if len(extracted_filings) >= 5: break
-        return extracted_filings
-    except Exception:
+            if len(results) >= 3: break # Nur die 3 neuesten
+        return results
+    except:
         return []
 
 def get_finnhub_data(ticker: str, api_key: str) -> dict:
+    """Holt Analysten-Konsens und Insider-Sentiment von Finnhub."""
     if not api_key: return {}
-    clean_ticker = ticker.split(".")[0].upper()
-    session = get_requests_session()
-    results = {"recommendations": None, "insider": None}
+    session = get_robust_session()
+    data = {}
     
     try:
-        rec_url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={clean_ticker}&token={api_key}"
-        rec_resp = session.get(rec_url, timeout=5)
-        if rec_resp.status_code == 200:
-            rec_data = rec_resp.json()
-            if rec_data and len(rec_data) > 0:
-                results["recommendations"] = rec_data[0] 
-    except Exception:
-        pass
-        
-    end_date = datetime.date.today().strftime('%Y-%m-%d')
-    start_date = (datetime.date.today() - datetime.timedelta(days=180)).strftime('%Y-%m-%d')
-    try:
-        ins_url = f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={clean_ticker}&from={start_date}&to={end_date}&token={api_key}"
-        ins_resp = session.get(ins_url, timeout=5)
-        if ins_resp.status_code == 200:
-            ins_data = ins_resp.json()
-            if ins_data.get("data") and len(ins_data["data"]) > 0:
-                df = pd.DataFrame(ins_data["data"])
-                results["insider"] = {
-                    "mspr": round(df["mspr"].mean(), 2), 
-                    "change": df["change"].sum()
-                }
-    except Exception:
-        pass
-        
-    return results
-
-def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
-    if hist.empty: return {}
-    close_price = hist["Close"].iloc[-1]
-    reference = hist["Close"].iloc[-2] if len(hist) >= 2 else hist["Open"].iloc[-1]
-    ref_label = "Vortag" if len(hist) >= 2 else "Handelsbeginn"
-    change_pct = ((close_price - reference) / reference) * 100 if reference else 0.0
+        # Analysten
+        rec_url = f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={api_key}"
+        rec_res = session.get(rec_url, timeout=3)
+        if rec_res.status_code == 200 and len(rec_res.json()) > 0:
+            data["recommendations"] = rec_res.json()[0]
+            
+        # Insider
+        ins_url = f"https://finnhub.io/api/v1/stock/insider-sentiment?symbol={ticker}&from=2024-01-01&to=2024-12-31&token={api_key}"
+        ins_res = session.get(ins_url, timeout=3)
+        if ins_res.status_code == 200 and ins_res.json().get('data'):
+            # Durchschnitt der MSPR (Management Sentiment)
+            mspr_list = [d['mspr'] for d in ins_res.json()['data']]
+            avg_mspr = round(sum(mspr_list) / len(mspr_list), 2)
+            data["insider"] = {"mspr": avg_mspr}
+    except: pass
     
-    hist['SMA20'] = hist['Close'].rolling(window=20).mean()
-    sma20_latest = hist['SMA20'].iloc[-1] if len(hist) >= 20 else None
-    trend_signal = "N/A"
-    if sma20_latest:
-        trend_signal = "BULLISH" if close_price > sma20_latest else "BEARISH"
-        
-    log_returns = np.log(hist['Close'] / hist['Close'].shift(1))
-    volatility = log_returns.tail(20).std() * (252 ** 0.5) * 100
-    vol_label = "Hoch" if volatility > 30 else ("Moderat" if volatility > 15 else "Niedrig")
-
-    div_rate = info.get("dividendRate") or info.get("trailingAnnualDividendRate")
-    dividend_yield = f"{(div_rate / close_price) * 100:.2f}%" if div_rate and close_price > 0 else "N/A"
-    
-    return {
-        "close": close_price, 
-        "change_pct": change_pct, 
-        "ref_label": ref_label, 
-        "market_cap": format_large_number(info.get("marketCap")), 
-        "pe_ratio": round(info.get("trailingPE", 0), 2) if info.get("trailingPE") else "N/A", 
-        "dividend_yield": dividend_yield,
-        "trend_signal": trend_signal,
-        "volatility": f"{volatility:.2f}% ({vol_label})" if not pd.isna(volatility) else "N/A"
-    }
-
-# --- KI LOGIK ---
-def filter_news_with_ai(client: genai.Client, ticker: str, user_input: str, raw_news: list[dict]) -> list[str]:
-    BLOCKED_PUBLISHERS = ["motley fool", "zacks", "seeking alpha", "investorplace", "tipranks", "thestreet", "kiplinger", "barron's"]
-    CLICKBAIT_KEYWORDS = ["vs", "better buy", "stock to buy", "should you", "buy right now", "dividend stock", "is it too late", "buy or sell"]
-    
-    pre_filtered_news = []
-    for n in raw_news:
-        pub = n.get("publisher", n.get("provider", "Unbekannt")).lower()
-        title = n.get("content", {}).get("title", n.get("title", "Kein Titel"))
-        if any(b in pub for b in BLOCKED_PUBLISHERS) or any(k in title.lower() for k in CLICKBAIT_KEYWORDS): continue
-        pre_filtered_news.append(f"[{pub.title()}] {title}")
-        if len(pre_filtered_news) >= 15: break
-        
-    if not pre_filtered_news: return []
-
-    prompt = f"Schlagzeilen für '{user_input}' ({ticker}):\n{chr(10).join(f'- {t}' for t in pre_filtered_news)}\nBehalte NUR harte Fakten. Liste ohne Herausgeber. Analysiere das Sentiment (BULLISH/BEARISH/NEUTRAL) für jede Schlagzeile. Falls nichts relevant: []."
-    try:
-        response = client.models.generate_content(
-            model=MODEL_NAME, 
-            contents=prompt, 
-            config=types.GenerateContentConfig(response_mime_type="application/json", response_schema=FilteredHeadlines, temperature=0.0)
-        )
-        formatted_news = []
-        for item in response.parsed.relevant_headlines[:5]:
-            emoji = "🟢" if item.sentiment.upper() == "BULLISH" else "🔴" if item.sentiment.upper() == "BEARISH" else "⚪"
-            formatted_news.append(f"{emoji} [{item.sentiment.upper()}] {item.headline}")
-        return formatted_news
-    except: 
-        return []
-
-def generate_analysis(client: genai.Client, ticker: str, metrics: dict, news_list: list[str], macro_data: dict = None, euro_macro_data: dict = None, sec_filings: list[dict] = None, finnhub_data: dict = None) -> str:
-    news_text = "\n".join([f"- {t}" for t in news_list]) if news_list else "KEINE RELEVANTEN NACHRICHTEN."
-    direction = "gestiegen" if metrics["change_pct"] >= 0 else "gefallen"
-    
-    is_european = ".DE" in ticker.upper() or ".F" in ticker.upper() or ".PA" in ticker.upper()
-
-    macro_text = ""
-    if is_european:
-        macro_text = "\n=== MAKROÖKONOMISCHES UMFELD FÜR EUROPA ===\n"
-        if euro_macro_data:
-            for key, val in euro_macro_data.items(): macro_text += f"- {key}: {val['value']}% (Update: {val['date']})\n"
-        macro_text += "\nANWEISUNG: Analysiere nur dieses europäische Framework. Erwähne US-Zinsen nicht.\n"
-    else:
-        if macro_data:
-            macro_text = "\n=== AKTUELLES MAKROÖKONOMISCHES UMFELD (USA) ===\n"
-            for key, val in macro_data.items(): macro_text += f"- {key}: {val['value']}% (Update: {val['date']})\n"
-            macro_text += "\nANWEISUNG: Analysiere, wie dieses US-Wirtschaftsumfeld die Bewertung beeinflusst.\n"
-
-    sec_text = ""
-    if sec_filings and not is_european:
-        sec_text = "\n=== JÜNGSTE OFFIZIELLE SEC FILINGS ===\n"
-        for f in sec_filings: sec_text += f"- Form {f['form']} am {f['filingDate']} (Betreff: {f['description']})\n"
-
-    finnhub_text = ""
-    if finnhub_data:
-        rec = finnhub_data.get("recommendations")
-        ins = finnhub_data.get("insider")
-        if rec or ins:
-            finnhub_text = "\n=== FINNHUB ANALYSTEN & INSIDER DATEN ===\n"
-            if rec:
-                finnhub_text += f"- Analysten-Konsens: {rec.get('strongBuy', 0) + rec.get('buy', 0)} Buy, {rec.get('hold', 0)} Hold, {rec.get('sell', 0) + rec.get('strongSell', 0)} Sell\n"
-            if ins:
-                sentiment_str = "Positiv (Insider kaufen)" if ins['mspr'] > 0 else "Negativ (Insider verkaufen)" if ins['mspr'] < 0 else "Neutral"
-                finnhub_text += f"- Insider Sentiment (letzte 6 Monate): {sentiment_str} (MSPR Score: {ins['mspr']})\n"
-            finnhub_text += "\nANWEISUNG: Beziehe diese Analysten-Ratings und das Verhalten der Insider zwingend in deine fundamentale Einordnung ein.\n"
-
-    prompt = (
-        f"Aktie {ticker} ist zum {metrics['ref_label']} um {abs(metrics['change_pct']):.2f}% {direction} (Letzter Kurs: {metrics['close']:.2f}).\n"
-        f"Technischer Trend (SMA20): {metrics['trend_signal']} | Volatilität (20 Tage): {metrics['volatility']}\n"
-        f"News mit Sentiment-Rating:\n{news_text}\n"
-        f"{sec_text}\n"
-        f"{finnhub_text}\n"
-        f"{macro_text}\n"
-        "Erkläre präzise WARUM der Kurs sich heute bewegt.\n"
-        "WICHTIG: Beginne DIREKT mit der ersten Überschrift. Schreibe KEINE Einleitungssätze. Nutze zwingend diese exakte Struktur:\n"
-        "### 🗞️ Was bewegt den Kurs?\n"
-        "### 📊 Fundamentale Einordnung\n"
-        "### 🏢 Sektor-Kontext\n"
-        "### 🌍 Makro-Kontext"
-    )
-    try: 
-        return client.models.generate_content(
-            model=MODEL_NAME, 
-            contents=prompt, 
-            config=types.GenerateContentConfig(temperature=0.2)
-        ).text
-    except Exception as e: 
-        return f"⚠️ Fehler: {e}"
+    return data
