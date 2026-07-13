@@ -3,7 +3,6 @@ pillow==10.4.0
 pandas
 requests
 numpy
-yfinance
 google-genai
 pydantic
 urllib3

@@ -26,26 +26,33 @@ def get_robust_session() -> requests.Session:
     return session
 
 # ==========================================
-# 1. MARKTDATEN (Jetzt 100% Finnhub API!)
+# 1. MARKTDATEN (Finnhub API - Gefixt!)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
     if not api_key: return query.strip().upper()
     session = get_robust_session()
     try:
-        res = session.get(f"https://finnhub.io/api/v1/search?q={query}&token={api_key}", timeout=5).json()
-        if res.get("result") and len(res["result"]) > 0:
-            return res["result"][0]["symbol"]
-    except: pass
+        res = session.get(f"https://finnhub.io/api/v1/search?q={query}&token={api_key}", timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("result") and len(data["result"]) > 0:
+                # FIX: Wir suchen explizit nach dem US-Ticker (ohne Punkt im Namen), 
+                # da Finnhub im Free-Tier nur US-Historienkurse erlaubt!
+                for item in data["result"]:
+                    if "." not in item["symbol"] and item["type"] == "Common Stock":
+                        return item["symbol"]
+                # Fallback: Nimm das erste
+                return data["result"][0]["symbol"]
+    except Exception as e:
+        print(f"Fehler bei der Ticker-Suche: {e}")
     return query.strip().upper()
 
 def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict], dict]:
-    """Lädt Kurse, News und Finanzdaten extrem schnell und legal via Finnhub."""
     if not api_key: return pd.DataFrame(), [], {}
     
     session = get_robust_session()
     base_url = "https://finnhub.io/api/v1"
     
-    # Zeiträume berechnen (heute und vor 3 Monaten)
     now = int(time.time())
     three_months_ago = now - (90 * 24 * 60 * 60)
     today_str = datetime.now().strftime('%Y-%m-%d')
@@ -54,12 +61,19 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
     # 1. Historische Kurse (Candles)
     df = pd.DataFrame()
     try:
-        res = session.get(f"{base_url}/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={api_key}").json()
-        if res.get("s") == "ok":
-            df = pd.DataFrame({"Close": res["c"], "Open": res["o"]}, index=pd.to_datetime(res["t"], unit='s'))
-    except: pass
+        res = session.get(f"{base_url}/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={api_key}")
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("s") == "ok":
+                df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
+            else:
+                print(f"Finnhub Candle Status für {ticker}: {data.get('s')} (Oft ein Zeichen für non-US Ticker im Free-Tier)")
+        else:
+            print(f"Finnhub Candle Fehler Code: {res.status_code}")
+    except Exception as e: 
+        print(f"Exception bei Candles: {e}")
 
-    # 2. Metadaten (KGV, Marktkapitalisierung)
+    # 2. Metadaten (Profil & Metriken)
     info = {}
     try:
         prof = session.get(f"{base_url}/stock/profile2?symbol={ticker}&token={api_key}").json()
@@ -68,21 +82,24 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
         info["shortName"] = prof.get("name", ticker)
         info["country"] = prof.get("country", "")
         if prof.get("marketCapitalization"):
-            info["marketCap"] = prof.get("marketCapitalization") * 1000000 # In Millionen angegeben
+            info["marketCap"] = prof.get("marketCapitalization") * 1000000 
 
         if mets.get("metric"):
             info["trailingPE"] = mets["metric"].get("peExclExtraTTM")
             dy = mets["metric"].get("dividendYieldIndicatedAnnual")
             if dy is not None: info["dividendYield"] = dy / 100.0
-    except: pass
+    except Exception as e: 
+        print(f"Exception bei Profil/Metriken: {e}")
 
     # 3. News
     news_mapped = []
     try:
         news_res = session.get(f"{base_url}/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={api_key}").json()
-        for n in news_res[:15]: 
-            news_mapped.append({"title": n.get("headline", ""), "publisher": n.get("source", "")})
-    except: pass
+        if isinstance(news_res, list): # Sicherstellen, dass es eine Liste ist und kein Error-Dict
+            for n in news_res[:15]: 
+                news_mapped.append({"title": n.get("headline", ""), "publisher": n.get("source", "")})
+    except Exception as e: 
+        print(f"Exception bei News: {e}")
 
     return df, news_mapped, info
 
@@ -106,16 +123,16 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
         vol_str = "N/A"
 
     mc = info.get("marketCap")
-    if mc is None: mc_str = "N/A"
+    if mc is None or pd.isna(mc): mc_str = "N/A"
     elif mc >= 1e12: mc_str = f"${mc/1e12:.2f} Bio."
     elif mc >= 1e9: mc_str = f"${mc/1e9:.2f} Mrd."
     else: mc_str = f"${mc/1e6:.2f} Mio."
 
     div = info.get("dividendYield")
-    div_str = f"{div*100:.2f}%" if div else "N/A"
+    div_str = f"{div*100:.2f}%" if div and not pd.isna(div) else "N/A"
 
     pe = info.get("trailingPE")
-    pe_str = f"{pe:.2f}" if pe else "N/A"
+    pe_str = f"{pe:.2f}" if pe and not pd.isna(pe) else "N/A"
 
     return {
         "close": close_price,
@@ -131,6 +148,7 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
 # 2. KI ANALYSE
 # ==========================================
 def filter_news_with_ai(client: genai.Client, ticker: str, user_input: str, raw_news: list[dict]) -> list[str]:
+    if not raw_news: return []
     BLOCKED_PUBLISHERS = ["motley fool", "zacks", "seeking alpha", "investorplace", "tipranks", "thestreet"]
     pre_filtered = []
     for n in raw_news:
