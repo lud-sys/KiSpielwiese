@@ -1,4 +1,5 @@
 streamlit==1.36.0
+pillow==10.4.0
 pandas
 requests
 numpy
