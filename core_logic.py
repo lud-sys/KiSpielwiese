@@ -60,7 +60,8 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
         mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}", timeout=5).json()
         
         info["shortName"] = prof.get("name", ticker)
-        info["country"] = prof.get("country", "US") 
+        # FIX für den SEC Tab: Wenn country leer ist, standardmäßig US setzen
+        info["country"] = prof.get("country") or "US" 
         if prof.get("marketCapitalization"):
             info["marketCap"] = prof.get("marketCapitalization") * 1000000 
             
@@ -81,14 +82,14 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
                 df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
     except: pass
 
-    # Fallback für Live-Kurs
+    # FIX FÜR EUROPÄISCHE AKTIEN: Fallback für Live-Kurs, falls Finnhub historische Daten für EU blockiert
     if df.empty:
         try:
             quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}", timeout=5).json()
-            if quote and "c" in quote and quote["c"] > 0:
+            if quote and quote.get("c", 0) > 0:
                 df = pd.DataFrame({
-                    "Close": [quote["pc"], quote["c"]],
-                    "Open": [quote["o"], quote["o"]]
+                    "Close": [quote.get("pc", quote["c"]), quote["c"]],
+                    "Open": [quote.get("o", quote["c"]), quote.get("o", quote["c"])]
                 }, index=[pd.Timestamp.now() - pd.Timedelta(days=1), pd.Timestamp.now()])
         except: pass
 
@@ -195,7 +196,6 @@ def get_macro_data(api_key: str) -> dict:
     if not api_key: return {}
     session = get_robust_session()
     data = {}
-    # FIX: Inflation braucht units=pc1 (Percent Change from Year Ago) statt dem rohen Index!
     endpoints = {
         "US Leitzins": {"id": "FEDFUNDS", "units": "lin"},
         "US Inflation": {"id": "CPIAUCSL", "units": "pc1"}
@@ -212,12 +212,14 @@ def get_macro_data(api_key: str) -> dict:
 def get_euro_macro_data() -> dict:
     data = {}
     try:
-        # FIX: Das offizielle DBnomics Paket nutzen! Das löst alle JSON-Parsierungs-Probleme.
+        # DBnomics API Aufruf mit offiziellem Paket (exakt aus deinem Backup)
         df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
-        if not df.empty and 'value' in df.columns:
-            # Drop NA filtert leere Felder automatisch raus
-            last_val = df['value'].dropna().iloc[-1]
-            data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
+        if df is not None and not df.empty and 'value' in df.columns:
+            # Sichert ab, dass das NA/NaN ignoriert wird
+            valid_vals = df['value'].dropna()
+            if not valid_vals.empty:
+                last_val = valid_vals.iloc[-1]
+                data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
     except Exception as e: 
         print(f"DBnomics Fehler: {e}")
     return data
