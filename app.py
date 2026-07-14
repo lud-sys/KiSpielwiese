@@ -43,7 +43,7 @@ def cached_macro_data(api_key: str):
     return get_macro_data(api_key)
 
 @st.cache_data(ttl=43200, show_spinner=False)
-def cached_euro_macro_data():
+def cached_euro_macro_data_v3():
     return get_euro_macro_data()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -70,11 +70,16 @@ def inject_custom_css():
         border-radius: 12px;
         padding: 20px;
         transition: all 0.3s ease;
-        min-height: 250px !important; 
         height: 100%;
         display: flex;
         flex-direction: column;
     }
+    @media (min-width: 768px) {
+        .feature-card {
+            min-height: 250px;
+        }
+    }
+    
     .feature-card:hover {
         border-color: #00FFA3;
         box-shadow: 0 4px 20px rgba(0, 255, 163, 0.05);
@@ -158,17 +163,12 @@ def render_dashboard(ticker: str, info: dict, metrics: dict, news_list: list[str
     st.divider()
     st.subheader(f"{company_name} ({ticker})")
     
-    kpi_col1, kpi_col2, kpi_col3 = st.columns(3)
+    # 4 saubere KPIs in einer Reihe!
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
     kpi_col1.metric("Aktueller Kurs", f"${metrics.get('close', 0):.2f}", f"{metrics.get('change_pct', 0):.2f}%")
     kpi_col2.metric("Marktkapitalisierung", metrics.get("market_cap", "N/A"))
     kpi_col3.metric("KGV (P/E)", metrics.get("pe_ratio", "N/A"))
-
-    st.markdown("<br>", unsafe_allow_html=True)
-
-    kpi_col4, kpi_col5, kpi_col6 = st.columns(3)
     kpi_col4.metric("Dividendenrendite", metrics.get("dividend_yield", "N/A"))
-    kpi_col5.metric("Trend (SMA 20)", metrics.get("trend_signal", "N/A"))
-    kpi_col6.metric("Volatilität (20 Tage)", metrics.get("volatility", "N/A"))
 
     st.markdown("<br>", unsafe_allow_html=True)
 
@@ -268,11 +268,13 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     macro_data = cached_macro_data(fred_key) if fred_key else {}
-    euro_macro_data = cached_euro_macro_data()
+    euro_macro_data = cached_euro_macro_data_v3() 
 
     if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
     if "search_input" not in st.session_state: st.session_state.search_input = ""
     if "search_history" not in st.session_state: st.session_state.search_history = []
+    
+    if "current_analysis_ticker" not in st.session_state: st.session_state.current_analysis_ticker = None
     if "current_dashboard_data" not in st.session_state: st.session_state.current_dashboard_data = {}
 
     def set_target(ticker):
@@ -340,7 +342,6 @@ def main():
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         
-        # Prüfen ob wir diesen Ticker schon im Tresor haben
         current_data = st.session_state.current_dashboard_data
         needs_reload = not current_data or current_data.get("original_query") != ticker_query
 
@@ -363,3 +364,10 @@ def main():
                     country = info.get("country", "")
                     is_us_stock = country in ["US", "United States"] if country else "." not in actual_ticker
                     sec_filings = []
+                    
+                    if is_us_stock and sec_email:
+                        st.write("📂 Scanne offizielle SEC Regulierungsberichte...")
+                        sec_filings = cached_sec_filings(actual_ticker, sec_email)
+                    
+                    st.write("🕵️‍♂️ Frage Analysten & Insider-Daten ab...")
+                    finnhub_data = cached_finnhub_data(actua
