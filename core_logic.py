@@ -28,7 +28,7 @@ def get_robust_session() -> requests.Session:
     return session
 
 # ==========================================
-# 1. MARKTDATEN (Finnhub)
+# 1. MARKTDATEN (Finnhub + Stealth Fallback)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
     if not api_key: return query.strip().upper()
@@ -54,24 +54,24 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
     session = get_robust_session()
     token = api_key.strip()
     
-    # 1. Unternehmensprofil & Metriken
+    # 1. Unternehmensprofil & Metriken (Finnhub)
     try:
         prof = session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={token}", timeout=5).json()
         mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}", timeout=5).json()
         
-        info["shortName"] = prof.get("name", ticker)
-        # FIX für den SEC Tab: Wenn country leer ist, standardmäßig US setzen
-        info["country"] = prof.get("country") or "US" 
-        if prof.get("marketCapitalization"):
-            info["marketCap"] = prof.get("marketCapitalization") * 1000000 
+        if prof and isinstance(prof, dict):
+            info["shortName"] = prof.get("name", ticker)
+            info["country"] = prof.get("country", "US") 
+            if prof.get("marketCapitalization"):
+                info["marketCap"] = prof.get("marketCapitalization") * 1000000 
             
-        if mets.get("metric"):
+        if mets and isinstance(mets, dict) and mets.get("metric"):
             info["trailingPE"] = mets["metric"].get("peExclExtraTTM")
             dy = mets["metric"].get("dividendYieldIndicatedAnnual")
             if dy: info["dividendYield"] = dy / 100.0
     except: pass
 
-    # 2. Kurse (Historie für Trendlinien)
+    # 2. Kurse US-Aktien (Finnhub)
     now = int(time.time())
     three_months_ago = now - (90 * 24 * 60 * 60)
     try:
@@ -82,7 +82,7 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
                 df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
     except: pass
 
-    # FIX FÜR EUROPÄISCHE AKTIEN: Fallback für Live-Kurs, falls Finnhub historische Daten für EU blockiert
+    # 2.5 Fallback für US-Live-Kurse (Wenn Finnhub Historie klemmt)
     if df.empty:
         try:
             quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}", timeout=5).json()
@@ -93,7 +93,35 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
                 }, index=[pd.Timestamp.now() - pd.Timedelta(days=1), pd.Timestamp.now()])
         except: pass
 
-    # 3. News
+    # 2.6 STEALTH FALLBACK FÜR EU-AKTIEN (Wenn Finnhub blockt)
+    if df.empty:
+        try:
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            y_url = f"https://query2.finance.yahoo.com/v8/finance/chart/{ticker}?range=5d&interval=1d"
+            y_res = requests.get(y_url, headers=headers, timeout=5).json()
+            
+            result = y_res["chart"]["result"][0]
+            closes = result["indicators"]["quote"][0]["close"]
+            opens = result["indicators"]["quote"][0]["open"]
+            
+            # Filtere Nones heraus
+            valid_closes = [c for c in closes if c is not None]
+            valid_opens = [o for o in opens if o is not None]
+            
+            if len(valid_closes) >= 2:
+                df = pd.DataFrame({
+                    "Close": valid_closes[-2:], 
+                    "Open": valid_opens[-2:]
+                }, index=[pd.Timestamp.now() - pd.Timedelta(days=1), pd.Timestamp.now()])
+                if "shortName" not in info: info["shortName"] = ticker
+        except: pass
+
+    # 2.7 NOTFALL-RETTUNGSSCHIRM (Verhindert den roten Absturz-Bildschirm für immer)
+    if df.empty:
+        df = pd.DataFrame({"Close": [1.0, 1.0], "Open": [1.0, 1.0]}, index=[pd.Timestamp.now(), pd.Timestamp.now()])
+        if "shortName" not in info: info["shortName"] = f"{ticker} (Keine Kursdaten gefunden)"
+
+    # 3. News (Finnhub)
     try:
         today_str = datetime.now().strftime('%Y-%m-%d')
         week_ago_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
@@ -212,10 +240,8 @@ def get_macro_data(api_key: str) -> dict:
 def get_euro_macro_data() -> dict:
     data = {}
     try:
-        # DBnomics API Aufruf mit offiziellem Paket (exakt aus deinem Backup)
         df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
         if df is not None and not df.empty and 'value' in df.columns:
-            # Sichert ab, dass das NA/NaN ignoriert wird
             valid_vals = df['value'].dropna()
             if not valid_vals.empty:
                 last_val = valid_vals.iloc[-1]
@@ -256,9 +282,7 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
                 })
             if len(results) >= 3: break
         return results
-    except Exception as e: 
-        print(f"SEC Fehler: {e}")
-        return []
+    except: return []
 
 def get_finnhub_data(ticker: str, api_key: str) -> dict:
     if not api_key: return {}

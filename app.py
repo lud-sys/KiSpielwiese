@@ -43,7 +43,7 @@ def cached_macro_data(api_key: str):
     return get_macro_data(api_key)
 
 @st.cache_data(ttl=43200, show_spinner=False)
-def cached_euro_macro_data_v3():
+def cached_euro_macro_data():
     return get_euro_macro_data()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -70,16 +70,11 @@ def inject_custom_css():
         border-radius: 12px;
         padding: 20px;
         transition: all 0.3s ease;
+        min-height: 250px !important; 
         height: 100%;
         display: flex;
         flex-direction: column;
     }
-    @media (min-width: 768px) {
-        .feature-card {
-            min-height: 250px;
-        }
-    }
-    
     .feature-card:hover {
         border-color: #00FFA3;
         box-shadow: 0 4px 20px rgba(0, 255, 163, 0.05);
@@ -273,13 +268,11 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     macro_data = cached_macro_data(fred_key) if fred_key else {}
-    euro_macro_data = cached_euro_macro_data_v3() 
+    euro_macro_data = cached_euro_macro_data()
 
     if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
     if "search_input" not in st.session_state: st.session_state.search_input = ""
     if "search_history" not in st.session_state: st.session_state.search_history = []
-    
-    if "current_analysis_ticker" not in st.session_state: st.session_state.current_analysis_ticker = None
     if "current_dashboard_data" not in st.session_state: st.session_state.current_dashboard_data = {}
 
     def set_target(ticker):
@@ -347,8 +340,11 @@ def main():
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         
-        # Nur laden, wenn neuer Ticker gesucht wird
-        if st.session_state.current_analysis_ticker != ticker_query:
+        # Prüfen ob wir diesen Ticker schon im Tresor haben
+        current_data = st.session_state.current_dashboard_data
+        needs_reload = not current_data or current_data.get("original_query") != ticker_query
+
+        if needs_reload:
             loading_container = st.empty()
             success = False 
             actual_ticker = ticker_query 
@@ -367,124 +363,3 @@ def main():
                     country = info.get("country", "")
                     is_us_stock = country in ["US", "United States"] if country else "." not in actual_ticker
                     sec_filings = []
-                    
-                    if is_us_stock and sec_email:
-                        st.write("📂 Scanne offizielle SEC Regulierungsberichte...")
-                        sec_filings = cached_sec_filings(actual_ticker, sec_email)
-                    
-                    st.write("🕵️‍♂️ Frage Analysten & Insider-Daten ab...")
-                    finnhub_data = cached_finnhub_data(actual_ticker, finnhub_key) if finnhub_key else {}
-                    
-                    st.write("🛡️ Trenne Signal von Rauschen...")
-                    filtered_news = filter_news_with_ai(client, actual_ticker, ticker_query, raw_news) 
-                    
-                    st.write("🧠 Generiere Analysten-Einschätzung...")
-                    metrics = calculate_metrics(hist, info) 
-                    
-                    analysis = generate_analysis(client, actual_ticker, metrics, filtered_news, macro_data, euro_macro_data, sec_filings, finnhub_data) 
-                    success = True
-
-            if success:
-                st.session_state.current_dashboard_data = {
-                    "ticker": actual_ticker,
-                    "info": info,
-                    "metrics": metrics,
-                    "filtered_news": filtered_news,
-                    "analysis": analysis,
-                    "raw_news_count": len(raw_news),
-                    "sec_filings": sec_filings,
-                    "finnhub_data": finnhub_data
-                }
-                
-                st.session_state.current_analysis_ticker = actual_ticker
-                st.session_state.target_ticker = actual_ticker
-                
-                if actual_ticker in st.session_state.search_history:
-                    st.session_state.search_history.remove(actual_ticker)
-                st.session_state.search_history.append(actual_ticker)
-                if len(st.session_state.search_history) > 5:
-                    st.session_state.search_history.pop(0)
-                
-                loading_container.empty()
-        
-        # RENDERN AUS DEM TRESOR 
-        if st.session_state.current_dashboard_data and st.session_state.current_dashboard_data.get("ticker") == st.session_state.target_ticker:
-            d = st.session_state.current_dashboard_data
-            render_dashboard(
-                d["ticker"], d["info"], d["metrics"], d["filtered_news"], 
-                d["analysis"], d["raw_news_count"], macro_data, 
-                euro_macro_data, d["sec_filings"], d["finnhub_data"]
-            )
-            
-    # ==========================================
-    # ANSICHT: STARTSEITE
-    # ==========================================
-    else:
-        st.write("")
-        c1, c2, c3 = st.columns(3)
-        
-        with c1:
-            st.markdown("""
-                <div class='feature-card'>
-                    <div style='background-color: rgba(0, 255, 163, 0.1); border: 1px solid rgba(0, 255, 163, 0.2); width: 45px; height: 45px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 15px;'>
-                        <span style='font-size: 1.4rem;'>📊</span>
-                    </div>
-                    <h3 style='margin: 0 0 10px 0; font-size: 1.15rem; color: #FAFAFA; font-weight: 600;'>Echtzeit-Daten</h3>
-                    <p style='color: #A0AEC0; font-size: 0.95rem; line-height: 1.5; margin: 0;'>
-                        Direkter Zugriff auf Live-Kurse, Marktkapitalisierung und fundamentale Metriken für weltweite Assets.
-                    </p>
-                </div>
-            """, unsafe_allow_html=True)
-                
-        with c2:
-            st.markdown("""
-                <div class='feature-card'>
-                    <div style='background-color: rgba(0, 184, 255, 0.1); border: 1px solid rgba(0, 184, 255, 0.2); width: 45px; height: 45px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 15px;'>
-                        <span style='font-size: 1.4rem;'>🛡️</span>
-                    </div>
-                    <h3 style='margin: 0 0 10px 0; font-size: 1.15rem; color: #FAFAFA; font-weight: 600;'>Signal vs. Rauschen</h3>
-                    <p style='color: #A0AEC0; font-size: 0.95rem; line-height: 1.5; margin: 0;'>
-                        Unser Filter-Algorithmus ignoriert Spekulationen. Analysiert werden ausschließlich verifizierte Fakten.
-                    </p>
-                </div>
-            """, unsafe_allow_html=True)
-                
-        with c3:
-            st.markdown("""
-                <div class='feature-card'>
-                    <div style='background-color: rgba(184, 0, 255, 0.1); border: 1px solid rgba(184, 0, 255, 0.2); width: 45px; height: 45px; border-radius: 10px; display: flex; align-items: center; justify-content: center; margin-bottom: 15px;'>
-                        <span style='font-size: 1.4rem;'>🧠</span>
-                    </div>
-                    <h3 style='margin: 0 0 10px 0; font-size: 1.15rem; color: #FAFAFA; font-weight: 600;'>KI-Analyse</h3>
-                    <p style='color: #A0AEC0; font-size: 0.95rem; line-height: 1.5; margin: 0;'>
-                        Googles KI korreliert Finanzdaten mit Nachrichten und liefert präzise Erklärungen für Kursbewegungen.
-                    </p>
-                </div>
-            """, unsafe_allow_html=True)
-
-        st.markdown("<hr style='border-color: #2D3748; margin: 30px 0px 20px 0px;'>", unsafe_allow_html=True)
-        st.markdown("### 💡 Marktführende Assets")
-        st.caption("Wählen Sie ein Asset aus, um sofort eine detaillierte Auswertung zu generieren:")
-        
-        sc1, sc2, sc3, sc4 = st.columns(4)
-        presets = [
-            ("NVIDIA Corp.", "NVDA", "Halbleiter & KI"),
-            ("Apple Inc.", "AAPL", "Consumer Electronics"),
-            ("Rheinmetall AG", "RHM.DE", "Luftfahrt & Rüstung"),
-            ("Bitcoin", "BTC-USD", "Digitale Leitwährung")
-        ]
-        columns = [sc1, sc2, sc3, sc4]
-        
-        for i, (name, preset_ticker, sector) in enumerate(presets):
-            with columns[i]:
-                with st.container(border=True):
-                    st.markdown(f"""
-                        <div style='margin-bottom: 8px;'>
-                            <strong style='font-size: 1.05em; color: #FAFAFA;'>{name}</strong><br>
-                            <span style='color: #A0AEC0; font-size: 0.85em;'>{sector}</span>
-                        </div>
-                    """, unsafe_allow_html=True)
-                    st.button("Analyse starten", key=f"preset_{preset_ticker}", use_container_width=True, on_click=set_target, args=(preset_ticker,))
-
-if __name__ == "__main__":
-    main()
