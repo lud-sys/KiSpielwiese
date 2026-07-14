@@ -8,7 +8,9 @@ from requests.adapters import HTTPAdapter
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
-import yfinance as yf
+
+# Das offizielle DBnomics Paket importieren!
+from dbnomics import fetch_series
 
 # ==========================================
 # KONFIGURATION
@@ -19,54 +21,88 @@ class FilteredHeadlines(BaseModel):
     relevant_headlines: list[str] = Field(description="Liste von harten, echten Schlagzeilen.")
 
 def get_robust_session() -> requests.Session:
-    """Session mit Retry-Logik und Chrome-Tarnung für stabilere API-Aufrufe."""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
-    session.mount("http://", adapter)
     return session
 
 # ==========================================
-# 1. MARKTDATEN (Weltweit via YFinance + Crashschutz)
+# 1. MARKTDATEN (Finnhub)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
-    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=1&newsCount=0"
+    if not api_key: return query.strip().upper()
     session = get_robust_session()
-    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
-        res = session.get(url, timeout=5)
+        res = session.get(f"https://finnhub.io/api/v1/search?q={query}&token={api_key.strip()}", timeout=5)
         if res.status_code == 200:
             data = res.json()
-            if data.get('quotes'):
-                return data['quotes'][0]['symbol']
+            if data.get("result") and len(data["result"]) > 0:
+                for item in data["result"]:
+                    if "." not in item["symbol"] and item["type"] == "Common Stock":
+                        return item["symbol"]
+                return data["result"][0]["symbol"]
     except: pass
     return query.strip().upper()
 
 def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict], dict]:
-    """Lädt Kurse weltweit via YFinance. Fängt Rate-Limits (Cloud-Abstürze) sicher ab."""
-    stock = yf.Ticker(ticker)
+    df = pd.DataFrame()
+    info = {}
+    news_mapped = []
+    if not api_key: return df, news_mapped, info
     
-    # 1. Historische Daten (Wichtig für Kurs & Chart)
+    session = get_robust_session()
+    token = api_key.strip()
+    
+    # 1. Unternehmensprofil & Metriken
     try:
-        hist = stock.history(period="3mo")
-    except Exception:
-        hist = pd.DataFrame()
+        prof = session.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={token}", timeout=5).json()
+        mets = session.get(f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={token}", timeout=5).json()
         
-    # 2. News
+        info["shortName"] = prof.get("name", ticker)
+        info["country"] = prof.get("country", "US") 
+        if prof.get("marketCapitalization"):
+            info["marketCap"] = prof.get("marketCapitalization") * 1000000 
+            
+        if mets.get("metric"):
+            info["trailingPE"] = mets["metric"].get("peExclExtraTTM")
+            dy = mets["metric"].get("dividendYieldIndicatedAnnual")
+            if dy: info["dividendYield"] = dy / 100.0
+    except: pass
+
+    # 2. Kurse (Historie für Trendlinien)
+    now = int(time.time())
+    three_months_ago = now - (90 * 24 * 60 * 60)
     try:
-        raw_news = stock.news
-        news_mapped = [{"title": n.get("title", ""), "publisher": n.get("publisher", "")} for n in raw_news[:15]]
-    except Exception:
-        news_mapped = []
-        
-    # 3. Unternehmensdaten / Info (Hier passiert der Absturz oft, daher strikt in try/except)
+        res = session.get(f"https://finnhub.io/api/v1/stock/candle?symbol={ticker}&resolution=D&from={three_months_ago}&to={now}&token={token}", timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("s") == "ok":
+                df = pd.DataFrame({"Close": data["c"], "Open": data["o"]}, index=pd.to_datetime(data["t"], unit='s'))
+    except: pass
+
+    # Fallback für Live-Kurs
+    if df.empty:
+        try:
+            quote = session.get(f"https://finnhub.io/api/v1/quote?symbol={ticker}&token={token}", timeout=5).json()
+            if quote and "c" in quote and quote["c"] > 0:
+                df = pd.DataFrame({
+                    "Close": [quote["pc"], quote["c"]],
+                    "Open": [quote["o"], quote["o"]]
+                }, index=[pd.Timestamp.now() - pd.Timedelta(days=1), pd.Timestamp.now()])
+        except: pass
+
+    # 3. News
     try:
-        info = stock.info
-    except Exception:
-        info = {}
-        
-    return hist, news_mapped, info
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        week_ago_str = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        news_res = session.get(f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={week_ago_str}&to={today_str}&token={token}", timeout=5).json()
+        if isinstance(news_res, list):
+            for n in news_res[:15]: 
+                news_mapped.append({"title": n.get("headline", ""), "publisher": n.get("source", "")})
+    except: pass
+    
+    return df, news_mapped, info
 
 def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
     if hist.empty: return {}
@@ -93,7 +129,7 @@ def calculate_metrics(hist: pd.DataFrame, info: dict) -> dict:
     elif mc >= 1e9: mc_str = f"${mc/1e9:.2f} Mrd."
     else: mc_str = f"${mc/1e6:.2f} Mio."
 
-    div = info.get("dividendYield") or info.get("trailingAnnualDividendYield")
+    div = info.get("dividendYield")
     div_str = f"{div*100:.2f}%" if div and not pd.isna(div) else "N/A"
 
     pe = info.get("trailingPE")
@@ -159,6 +195,7 @@ def get_macro_data(api_key: str) -> dict:
     if not api_key: return {}
     session = get_robust_session()
     data = {}
+    # FIX: Inflation braucht units=pc1 (Percent Change from Year Ago) statt dem rohen Index!
     endpoints = {
         "US Leitzins": {"id": "FEDFUNDS", "units": "lin"},
         "US Inflation": {"id": "CPIAUCSL", "units": "pc1"}
@@ -173,36 +210,22 @@ def get_macro_data(api_key: str) -> dict:
     return data
 
 def get_euro_macro_data() -> dict:
-    """Holt EZB Daten über die direkte JSON-API. (Schneller und ohne Zusatz-Pakete!)"""
-    session = get_robust_session()
     data = {}
     try:
-        # WICHTIG: ?observations=1 MUSS angehängt sein, damit Werte kommen
-        url = "https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV?observations=1"
-        res = session.get(url, timeout=10)
-        
-        if res.status_code == 200:
-            json_data = res.json()
-            # Sehr sicheres Hangeln durch den JSON-Baum
-            if 'series' in json_data and 'docs' in json_data['series']:
-                docs = json_data['series']['docs']
-                if len(docs) > 0 and 'value' in docs[0]:
-                    values = docs[0]['value']
-                    
-                    # Die API gibt die Werte chronologisch aus. Wir suchen von hinten nach vorne den letzten gültigen Wert.
-                    for v in reversed(values):
-                        # Ignoriere leere Werte oder den String "NA"
-                        if v is not None and str(v).strip().upper() != 'NA':
-                            data["EZB Leitzins"] = {"value": round(float(v), 2)}
-                            break
-    except Exception as e:
+        # FIX: Das offizielle DBnomics Paket nutzen! Das löst alle JSON-Parsierungs-Probleme.
+        df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
+        if not df.empty and 'value' in df.columns:
+            # Drop NA filtert leere Felder automatisch raus
+            last_val = df['value'].dropna().iloc[-1]
+            data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
+    except Exception as e: 
         print(f"DBnomics Fehler: {e}")
-        
     return data
 
 def get_sec_filings(ticker: str, email: str) -> list[dict]:
     if not email: return []
     session = get_robust_session()
+    
     clean_email = email.strip()
     session.headers.update({
         "User-Agent": f"TrueFin_Terminal ({clean_email})",
@@ -232,6 +255,7 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
             if len(results) >= 3: break
         return results
     except Exception as e: 
+        print(f"SEC Fehler: {e}")
         return []
 
 def get_finnhub_data(ticker: str, api_key: str) -> dict:

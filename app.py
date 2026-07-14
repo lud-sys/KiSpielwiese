@@ -42,9 +42,8 @@ def cached_load_data(ticker: str, api_key: str):
 def cached_macro_data(api_key: str):
     return get_macro_data(api_key)
 
-# CACHE BUSTER! Die Endung _v2 zwingt Streamlit, den Cache zu leeren.
 @st.cache_data(ttl=43200, show_spinner=False)
-def cached_euro_macro_data_v2():
+def cached_euro_macro_data():
     return get_euro_macro_data()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -269,12 +268,14 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     macro_data = cached_macro_data(fred_key) if fred_key else {}
-    euro_macro_data = cached_euro_macro_data_v2() # FIX: CACHE BUSTER
+    euro_macro_data = cached_euro_macro_data()
 
+    # --- FIX: GLOBALES STATE MANAGEMENT GEGEN RANDOM RELOADS ---
     if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
     if "search_input" not in st.session_state: st.session_state.search_input = ""
     if "search_history" not in st.session_state: st.session_state.search_history = []
     
+    # Hier speichern wir die fertige KI-Analyse, damit sie nicht neu geladen wird
     if "current_analysis_ticker" not in st.session_state: st.session_state.current_analysis_ticker = None
     if "current_dashboard_data" not in st.session_state: st.session_state.current_dashboard_data = {}
 
@@ -343,46 +344,49 @@ def main():
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         
-        # Nur analysieren, wenn es eine NEUE Aktie ist
+        # FIX: Nur analysieren, wenn es eine NEUE Aktie ist! 
+        # (Verhindert das nervige Neuladen bei Klicks auf Tabs!)
         if st.session_state.current_analysis_ticker != ticker_query:
             loading_container = st.empty()
             success = False 
-            actual_ticker = ticker_query 
             
             with loading_container.status(f"Analysiere Marktdaten für '{ticker_query}'...", expanded=True) as status:
                 st.write("🔍 Identifiziere Ticker-Symbol...")
-                actual_ticker = cached_get_ticker(ticker_query, finnhub_key) 
+                ticker = cached_get_ticker(ticker_query, finnhub_key) 
                 
-                st.write(f"📡 Lade Realtime-Daten für {actual_ticker}...")
-                hist, raw_news, info = cached_load_data(actual_ticker, finnhub_key) 
+                st.write(f"📡 Lade Realtime-Daten für {ticker}...")
+                hist, raw_news, info = cached_load_data(ticker, finnhub_key) 
                 
                 if hist.empty:
                     status.update(label="Fehler bei der Datenabfrage", state="error", expanded=True)
-                    st.error(f"Keine Daten für '{actual_ticker}' gefunden. Bitte überprüfe die Schreibweise.")
+                    st.error(f"Keine Daten für '{ticker}' gefunden. Bitte überprüfe die Schreibweise.")
                 else:
                     country = info.get("country", "")
-                    is_us_stock = country in ["US", "United States"] if country else "." not in actual_ticker
+                    is_us_stock = country in ["US", "United States"] if country else "." not in ticker
                     sec_filings = []
                     
                     if is_us_stock and sec_email:
                         st.write("📂 Scanne offizielle SEC Regulierungsberichte...")
-                        sec_filings = cached_sec_filings(actual_ticker, sec_email)
+                        sec_filings = cached_sec_filings(ticker, sec_email)
                     
                     st.write("🕵️‍♂️ Frage Analysten & Insider-Daten ab...")
-                    finnhub_data = cached_finnhub_data(actual_ticker, finnhub_key) if finnhub_key else {}
+                    finnhub_data = cached_finnhub_data(ticker, finnhub_key) if finnhub_key else {}
                     
                     st.write("🛡️ Trenne Signal von Rauschen...")
-                    filtered_news = filter_news_with_ai(client, actual_ticker, ticker_query, raw_news) 
+                    filtered_news = filter_news_with_ai(client, ticker, ticker_query, raw_news) 
                     
                     st.write("🧠 Generiere Analysten-Einschätzung...")
                     metrics = calculate_metrics(hist, info) 
                     
-                    analysis = generate_analysis(client, actual_ticker, metrics, filtered_news, macro_data, euro_macro_data, sec_filings, finnhub_data) 
+                    analysis = generate_analysis(client, ticker, metrics, filtered_news, macro_data, euro_macro_data, sec_filings, finnhub_data) 
                     success = True
 
             if success:
+                if ticker != ticker_query: set_target(ticker)
+                
+                # Wir legen alle Daten gesichert in den Tresor (Session State) ab!
                 st.session_state.current_dashboard_data = {
-                    "ticker": actual_ticker,
+                    "ticker": ticker,
                     "info": info,
                     "metrics": metrics,
                     "filtered_news": filtered_news,
@@ -391,24 +395,12 @@ def main():
                     "sec_filings": sec_filings,
                     "finnhub_data": finnhub_data
                 }
-                
-                st.session_state.current_analysis_ticker = actual_ticker
-                st.session_state.target_ticker = actual_ticker
-                
-                if actual_ticker in st.session_state.search_history:
-                    st.session_state.search_history.remove(actual_ticker)
-                st.session_state.search_history.append(actual_ticker)
-                if len(st.session_state.search_history) > 5:
-                    st.session_state.search_history.pop(0)
-                
+                # Wir merken uns, dass diese Aktie bereits geladen wurde
+                st.session_state.current_analysis_ticker = st.session_state.target_ticker
                 loading_container.empty()
-                
-                # Zwingt die App, bei einer Umwandlung (z.B. "Visa" -> "V") die Ansicht zu aktualisieren
-                if ticker_query != actual_ticker:
-                    st.rerun()
         
-        # RENDERN AUS DEM TRESOR 
-        if st.session_state.current_dashboard_data and st.session_state.current_dashboard_data.get("ticker") == st.session_state.target_ticker:
+        # RENDERN AUS DEM TRESOR (Dadurch ist die App blitzschnell und ruckelt nicht mehr)
+        if st.session_state.current_analysis_ticker == ticker_query and st.session_state.current_dashboard_data:
             d = st.session_state.current_dashboard_data
             render_dashboard(
                 d["ticker"], d["info"], d["metrics"], d["filtered_news"], 
