@@ -25,8 +25,8 @@ def load_api_keys() -> tuple[str, str, str, str]:
     sec_email = os.environ.get("SEC_API_EMAIL") or st.secrets.get("SEC_API_EMAIL")
     finnhub_key = os.environ.get("FINNHUB_API_KEY") or st.secrets.get("FINNHUB_API_KEY")
     
-    if not gemini_key:
-        st.error("🚨 Gemini-API-Key fehlt! Bitte in den Secrets hinterlegen.")
+    if not gemini_key or not finnhub_key:
+        st.error("🚨 Gemini-API-Key ODER Finnhub-API-Key fehlt! Bitte in den Secrets hinterlegen.")
         st.stop()
     return gemini_key, fred_key, sec_email, finnhub_key
 
@@ -42,8 +42,9 @@ def cached_load_data(ticker: str, api_key: str):
 def cached_macro_data(api_key: str):
     return get_macro_data(api_key)
 
+# CACHE BUSTER! Die Endung _v2 zwingt Streamlit, den Cache zu leeren.
 @st.cache_data(ttl=43200, show_spinner=False)
-def cached_euro_macro_data():
+def cached_euro_macro_data_v2():
     return get_euro_macro_data()
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -268,7 +269,7 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     macro_data = cached_macro_data(fred_key) if fred_key else {}
-    euro_macro_data = cached_euro_macro_data()
+    euro_macro_data = cached_euro_macro_data_v2() # FIX: CACHE BUSTER
 
     if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
     if "search_input" not in st.session_state: st.session_state.search_input = ""
@@ -342,11 +343,11 @@ def main():
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         
-        # HIER IST DER FIX FÜR VISA/MASTERCARD:
+        # Nur analysieren, wenn es eine NEUE Aktie ist
         if st.session_state.current_analysis_ticker != ticker_query:
             loading_container = st.empty()
             success = False 
-            actual_ticker = ticker_query # Fallback
+            actual_ticker = ticker_query 
             
             with loading_container.status(f"Analysiere Marktdaten für '{ticker_query}'...", expanded=True) as status:
                 st.write("🔍 Identifiziere Ticker-Symbol...")
@@ -380,7 +381,6 @@ def main():
                     success = True
 
             if success:
-                # Tresor befüllen
                 st.session_state.current_dashboard_data = {
                     "ticker": actual_ticker,
                     "info": info,
@@ -392,7 +392,6 @@ def main():
                     "finnhub_data": finnhub_data
                 }
                 
-                # Wenn wir 'Visa' gesucht haben, das Ergebnis aber 'V' ist, synchronisieren wir das System
                 st.session_state.current_analysis_ticker = actual_ticker
                 st.session_state.target_ticker = actual_ticker
                 
@@ -404,7 +403,7 @@ def main():
                 
                 loading_container.empty()
                 
-                # Zwingt die App, sich einmal sauber mit dem neuen Ticker ('V') neuzustarten!
+                # Zwingt die App, bei einer Umwandlung (z.B. "Visa" -> "V") die Ansicht zu aktualisieren
                 if ticker_query != actual_ticker:
                     st.rerun()
         

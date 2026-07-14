@@ -9,7 +9,6 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 import yfinance as yf
-from dbnomics import fetch_series # <-- Das offizielle Paket, exakt wie in der Doku!
 
 # ==========================================
 # KONFIGURATION
@@ -20,10 +19,12 @@ class FilteredHeadlines(BaseModel):
     relevant_headlines: list[str] = Field(description="Liste von harten, echten Schlagzeilen.")
 
 def get_robust_session() -> requests.Session:
+    """Session mit Retry-Logik und Chrome-Tarnung für stabilere API-Aufrufe."""
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount("https://", adapter)
+    session.mount("http://", adapter)
     return session
 
 # ==========================================
@@ -32,7 +33,7 @@ def get_robust_session() -> requests.Session:
 def get_ticker_from_name(query: str, api_key: str) -> str:
     url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=1&newsCount=0"
     session = get_robust_session()
-    session.headers.update({"User-Agent": "Mozilla/5.0"})
+    session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
     try:
         res = session.get(url, timeout=5)
         if res.status_code == 200:
@@ -43,19 +44,23 @@ def get_ticker_from_name(query: str, api_key: str) -> str:
     return query.strip().upper()
 
 def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict], dict]:
+    """Lädt Kurse weltweit via YFinance. Fängt Rate-Limits (Cloud-Abstürze) sicher ab."""
     stock = yf.Ticker(ticker)
     
+    # 1. Historische Daten (Wichtig für Kurs & Chart)
     try:
         hist = stock.history(period="3mo")
     except Exception:
         hist = pd.DataFrame()
         
+    # 2. News
     try:
         raw_news = stock.news
         news_mapped = [{"title": n.get("title", ""), "publisher": n.get("publisher", "")} for n in raw_news[:15]]
     except Exception:
         news_mapped = []
         
+    # 3. Unternehmensdaten / Info (Hier passiert der Absturz oft, daher strikt in try/except)
     try:
         info = stock.info
     except Exception:
@@ -168,22 +173,31 @@ def get_macro_data(api_key: str) -> dict:
     return data
 
 def get_euro_macro_data() -> dict:
-    """Holt EZB Daten über das offizielle DBnomics Python-Paket."""
+    """Holt EZB Daten über die direkte JSON-API. (Schneller und ohne Zusatz-Pakete!)"""
+    session = get_robust_session()
     data = {}
     try:
-        # Offizieller Aufruf nach Doku. Gibt Pandas DataFrame zurück.
-        df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
+        # WICHTIG: ?observations=1 MUSS angehängt sein, damit Werte kommen
+        url = "https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV?observations=1"
+        res = session.get(url, timeout=10)
         
-        # DataFrame validieren und 'NA' Werte ignorieren
-        if df is not None and not df.empty and 'value' in df.columns:
-            # dropna() löscht automatisch alle leeren "NA" Einträge aus der Tabelle
-            valid_values = df['value'].dropna()
-            if not valid_values.empty:
-                # iloc[-1] nimmt den aktuellsten, echten Wert
-                last_val = valid_values.iloc[-1]
-                data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
-    except Exception as e: 
+        if res.status_code == 200:
+            json_data = res.json()
+            # Sehr sicheres Hangeln durch den JSON-Baum
+            if 'series' in json_data and 'docs' in json_data['series']:
+                docs = json_data['series']['docs']
+                if len(docs) > 0 and 'value' in docs[0]:
+                    values = docs[0]['value']
+                    
+                    # Die API gibt die Werte chronologisch aus. Wir suchen von hinten nach vorne den letzten gültigen Wert.
+                    for v in reversed(values):
+                        # Ignoriere leere Werte oder den String "NA"
+                        if v is not None and str(v).strip().upper() != 'NA':
+                            data["EZB Leitzins"] = {"value": round(float(v), 2)}
+                            break
+    except Exception as e:
         print(f"DBnomics Fehler: {e}")
+        
     return data
 
 def get_sec_filings(ticker: str, email: str) -> list[dict]:
