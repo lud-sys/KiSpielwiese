@@ -42,7 +42,6 @@ def cached_load_data(ticker: str, api_key: str):
 def cached_macro_data(api_key: str):
     return get_macro_data(api_key)
 
-# CACHE-BUSTER: Wir zwingen Streamlit mit "_v3" den kaputten DBnomics Cache zu vergessen!
 @st.cache_data(ttl=43200, show_spinner=False)
 def cached_euro_macro_data_v3():
     return get_euro_macro_data()
@@ -65,7 +64,6 @@ def inject_custom_css():
     footer {visibility: hidden;}
     .block-container { padding-top: 2rem !important; max-width: 1150px; }
     
-    /* MOBILE FIX: Die Boxen passen sich jetzt dynamisch an. Keine Quetschungen auf dem Handy! */
     .feature-card {
         background-color: #1E2530;
         border: 1px solid #2D3748;
@@ -275,7 +273,6 @@ def main():
     client = genai.Client(api_key=gemini_key)
 
     macro_data = cached_macro_data(fred_key) if fred_key else {}
-    # Den "_v3" Aufruf ausführen, um den Cache für DBnomics garantiert zu leeren!
     euro_macro_data = cached_euro_macro_data_v3() 
 
     if "target_ticker" not in st.session_state: st.session_state.target_ticker = None
@@ -350,7 +347,7 @@ def main():
     if st.session_state.target_ticker:
         ticker_query = st.session_state.target_ticker
         
-        # VISA/MASTERCARD BUG FIX: Das zerstörerische st.rerun() wurde entfernt.
+        # Nur laden, wenn neuer Ticker gesucht wird
         if st.session_state.current_analysis_ticker != ticker_query:
             loading_container = st.empty()
             success = False 
@@ -399,10 +396,8 @@ def main():
                     "finnhub_data": finnhub_data
                 }
                 
-                # Wir aktualisieren den Ticker sauber im Hintergrund
                 st.session_state.current_analysis_ticker = actual_ticker
                 st.session_state.target_ticker = actual_ticker
-                st.session_state.search_input = actual_ticker
                 
                 if actual_ticker in st.session_state.search_history:
                     st.session_state.search_history.remove(actual_ticker)
