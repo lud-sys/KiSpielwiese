@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 import yfinance as yf
+from dbnomics import fetch_series # <-- Das offizielle Paket, exakt wie in der Doku!
 
 # ==========================================
 # KONFIGURATION
@@ -29,7 +30,6 @@ def get_robust_session() -> requests.Session:
 # 1. MARKTDATEN (Weltweit via YFinance + Crashschutz)
 # ==========================================
 def get_ticker_from_name(query: str, api_key: str) -> str:
-    # Sucht erst über Yahoo Finance, das ist weltweit zuverlässiger
     url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}&quotesCount=1&newsCount=0"
     session = get_robust_session()
     session.headers.update({"User-Agent": "Mozilla/5.0"})
@@ -43,7 +43,6 @@ def get_ticker_from_name(query: str, api_key: str) -> str:
     return query.strip().upper()
 
 def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict], dict]:
-    """Lädt Kurse weltweit via YFinance. Fängt Rate-Limits (Cloud-Abstürze) sicher ab."""
     stock = yf.Ticker(ticker)
     
     try:
@@ -52,14 +51,12 @@ def load_stock_data(ticker: str, api_key: str) -> tuple[pd.DataFrame, list[dict]
         hist = pd.DataFrame()
         
     try:
-        # News aus yfinance extrahieren
         raw_news = stock.news
         news_mapped = [{"title": n.get("title", ""), "publisher": n.get("publisher", "")} for n in raw_news[:15]]
     except Exception:
         news_mapped = []
         
     try:
-        # stock.info verursacht oft den Cloud-Absturz. try/except blockt das ab!
         info = stock.info
     except Exception:
         info = {}
@@ -171,23 +168,20 @@ def get_macro_data(api_key: str) -> dict:
     return data
 
 def get_euro_macro_data() -> dict:
-    """Holt EZB Daten über die rohe DBnomics Web-API. Das Python-Paket wird NICHT benötigt!"""
-    session = get_robust_session()
+    """Holt EZB Daten über das offizielle DBnomics Python-Paket."""
     data = {}
     try:
-        # WICHTIG: ?observations=1 anhängen, sonst kommen nur Metadaten zurück!
-        url = "https://api.db.nomics.world/v22/series/ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV?observations=1"
-        res = session.get(url, timeout=10)
-        if res.status_code == 200:
-            json_data = res.json()
-            docs = json_data.get('series', {}).get('docs', [])
-            if docs:
-                values = docs[0].get('value', [])
-                # Wir gehen die Liste rückwärts durch und suchen den ersten echten Wert (ignoriert 'NA')
-                for v in reversed(values):
-                    if v is not None and str(v).lower() != 'na':
-                        data["EZB Leitzins"] = {"value": round(float(v), 2)}
-                        break
+        # Offizieller Aufruf nach Doku. Gibt Pandas DataFrame zurück.
+        df = fetch_series("ECB/FM/M.U2.EUR.4F.KR.MRR_RT.LEV")
+        
+        # DataFrame validieren und 'NA' Werte ignorieren
+        if df is not None and not df.empty and 'value' in df.columns:
+            # dropna() löscht automatisch alle leeren "NA" Einträge aus der Tabelle
+            valid_values = df['value'].dropna()
+            if not valid_values.empty:
+                # iloc[-1] nimmt den aktuellsten, echten Wert
+                last_val = valid_values.iloc[-1]
+                data["EZB Leitzins"] = {"value": round(float(last_val), 2)}
     except Exception as e: 
         print(f"DBnomics Fehler: {e}")
     return data
@@ -227,7 +221,6 @@ def get_sec_filings(ticker: str, email: str) -> list[dict]:
         return []
 
 def get_finnhub_data(ticker: str, api_key: str) -> dict:
-    """Nutzt Finnhub rein als Zusatzdaten-Quelle für Analysten (funktioniert auch oft bei EU Aktien)."""
     if not api_key: return {}
     session = get_robust_session()
     data = {}
